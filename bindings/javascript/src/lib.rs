@@ -257,6 +257,15 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
             core_opts = core_opts.with_encryption(true);
         }
     }
+    #[cfg(feature = "default-postgres")]
+    {
+        core_opts = core_opts
+            .with_postgres(true)
+            .with_views(true)
+            .with_custom_types(true)
+            .with_attach(true)
+            .with_generated_columns(true);
+    }
     let io = &db.io;
     // Parse encryption key if encryption options are provided
     let encryption_key = if let Some(opts) = &db.opts {

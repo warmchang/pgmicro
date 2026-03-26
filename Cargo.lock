@@ -4106,6 +4106,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgmicro"
+version = "0.6.0-pre.7"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cfg-if",
+ "clap",
+ "clap_complete",
+ "comfy-table",
+ "ctrlc",
+ "dirs 5.0.1",
+ "futures",
+ "include_dir",
+ "itertools 0.14.0",
+ "libc",
+ "limbo_completion",
+ "mimalloc",
+ "nu-ansi-term",
+ "pgwire",
+ "rustyline",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "shlex",
+ "syntect",
+ "tokio",
+ "toml",
+ "toml_edit 0.22.26",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "turso_core",
+ "turso_parser_pg",
+ "validator",
+]
+
+[[package]]
 name = "pgwire"
 version = "0.36.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

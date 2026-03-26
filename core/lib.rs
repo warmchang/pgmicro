@@ -271,13 +271,22 @@ pub enum TempStore {
 }
 
 /// Control SQL parsing dialect.
-/// - 0 = SQLite (default)
-/// - 1 = PostgreSQL
-#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq, Default)]
+/// - 0 = SQLite (default without `default-postgres` feature)
+/// - 1 = PostgreSQL (default with `default-postgres` feature)
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
 pub enum SqlDialect {
-    #[default]
     Sqlite = 0,
     Postgres = 1,
+}
+
+impl Default for SqlDialect {
+    fn default() -> Self {
+        if cfg!(feature = "default-postgres") {
+            SqlDialect::Postgres
+        } else {
+            SqlDialect::Sqlite
+        }
+    }
 }
 
 pub(crate) type MvStore = mvcc::MvStore<mvcc::MvccClock>;
@@ -1391,7 +1400,7 @@ impl Database {
             encryption_cipher_mode: AtomicCipherMode::new(encryption_cipher),
             sync_mode: AtomicSyncMode::new(SyncMode::Full),
             temp_store: AtomicTempStore::new(TempStore::Default),
-            sql_dialect: AtomicSqlDialect::new(SqlDialect::Sqlite),
+            sql_dialect: AtomicSqlDialect::new(SqlDialect::default()),
             data_sync_retry: AtomicBool::new(false),
             busy_handler: RwLock::new(BusyHandler::None),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),

@@ -1,0 +1,266 @@
+name: Build & publish pgmicro
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    tags:
+      - pgmicro-v*
+  pull_request:
+    branches:
+      - master
+
+env:
+  DEBUG: napi:*
+  MACOSX_DEPLOYMENT_TARGET: "10.13"
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: 10
+
+concurrency:
+  group: pgmicro-napi-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-napi:
+    name: NAPI ${{ matrix.settings.target }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - host: macos-latest
+            target: aarch64-apple-darwin
+            build: |
+              cd bindings/javascript
+              npx napi build --platform --features default-postgres --esm \
+                --manifest-path ../../bindings/javascript/Cargo.toml \
+                --output-dir ../../npm/pgmicro \
+                --target aarch64-apple-darwin
+              cd ../../npm/pgmicro
+              for f in turso.*.node; do mv "$f" "${f/turso./pgmicro.}"; done
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
+            build: |
+              cd bindings/javascript
+              npx napi build --platform --features default-postgres --esm \
+                --manifest-path ../../bindings/javascript/Cargo.toml \
+                --output-dir ../../npm/pgmicro \
+                --target x86_64-unknown-linux-gnu
+              cd ../../npm/pgmicro
+              for f in turso.*.node; do mv "$f" "${f/turso./pgmicro.}"; done
+          - host: blacksmith-2vcpu-ubuntu-2404-arm
+            target: aarch64-unknown-linux-gnu
+            build: |
+              cd bindings/javascript
+              npx napi build --platform --features default-postgres --esm \
+                --manifest-path ../../bindings/javascript/Cargo.toml \
+                --output-dir ../../npm/pgmicro \
+                --target aarch64-unknown-linux-gnu
+              cd ../../npm/pgmicro
+              for f in turso.*.node; do mv "$f" "${f/turso./pgmicro.}"; done
+    runs-on: ${{ matrix.settings.host }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup node
+        uses: actions/setup-node@v4
+        if: ${{ !matrix.settings.docker }}
+        with:
+          node-version: 20
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        if: ${{ !matrix.settings.docker }}
+        with:
+          toolchain: stable
+          targets: ${{ matrix.settings.target }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            .cargo-cache
+            target/
+          key: pgmicro-napi-${{ matrix.settings.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: pgmicro-napi-${{ matrix.settings.target }}-
+          save-always: true
+      - name: Install JS dependencies
+        working-directory: bindings/javascript
+        run: yarn install
+      - name: Build common
+        working-directory: bindings/javascript
+        run: yarn workspace @tursodatabase/database-common build
+      - name: Build in docker
+        if: ${{ matrix.settings.docker }}
+        working-directory: .
+        shell: bash
+        run: |
+          docker run --rm --user 0:0 \
+            -v ${{ github.workspace }}/.cargo-cache/git/db:/usr/local/cargo/git/db \
+            -v ${{ github.workspace }}/.cargo/registry/cache:/usr/local/cargo/registry/cache \
+            -v ${{ github.workspace }}/.cargo/registry/index:/usr/local/cargo/registry/index \
+            -v ${{ github.workspace }}:/build \
+            -w /build \
+            ${{ matrix.settings.docker }} \
+            bash -c "${{ matrix.settings.build }}"
+      - name: Build
+        if: ${{ !matrix.settings.docker }}
+        shell: bash
+        run: ${{ matrix.settings.build }}
+      - name: Upload NAPI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgmicro-napi-${{ matrix.settings.target }}
+          path: npm/pgmicro/pgmicro.*.node
+          if-no-files-found: error
+
+  build-cli:
+    name: CLI ${{ matrix.settings.target }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - host: macos-latest
+            target: aarch64-apple-darwin
+            platform-dir: darwin-arm64
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform-dir: linux-x64-gnu
+          - host: blacksmith-2vcpu-ubuntu-2404-arm
+            target: aarch64-unknown-linux-gnu
+            platform-dir: linux-arm64-gnu
+    runs-on: ${{ matrix.settings.host }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.settings.target }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: pgmicro-cli-${{ matrix.settings.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: pgmicro-cli-${{ matrix.settings.target }}-
+          save-always: true
+      - name: Build pgmicro CLI
+        run: cargo build --bin pgmicro --release --target ${{ matrix.settings.target }}
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgmicro-cli-${{ matrix.settings.target }}
+          path: target/${{ matrix.settings.target }}/release/pgmicro
+          if-no-files-found: error
+
+  package:
+    name: Package npm artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs:
+      - build-napi
+      - build-cli
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Download all NAPI artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          name: pgmicro-napi-aarch64-apple-darwin
+          path: npm/darwin-arm64/
+      - uses: actions/download-artifact@v4
+        with:
+          name: pgmicro-napi-x86_64-unknown-linux-gnu
+          path: npm/linux-x64-gnu/
+      - uses: actions/download-artifact@v4
+        with:
+          name: pgmicro-napi-aarch64-unknown-linux-gnu
+          path: npm/linux-arm64-gnu/
+
+      # Download all CLI artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          name: pgmicro-cli-aarch64-apple-darwin
+          path: npm/darwin-arm64/
+      - uses: actions/download-artifact@v4
+        with:
+          name: pgmicro-cli-x86_64-unknown-linux-gnu
+          path: npm/linux-x64-gnu/
+      - uses: actions/download-artifact@v4
+        with:
+          name: pgmicro-cli-aarch64-unknown-linux-gnu
+          path: npm/linux-arm64-gnu/
+
+      - name: Make CLI binaries executable
+        run: |
+          chmod +x npm/darwin-arm64/pgmicro
+          chmod +x npm/linux-x64-gnu/pgmicro
+          chmod +x npm/linux-arm64-gnu/pgmicro
+
+      - name: Build TypeScript
+        working-directory: npm/pgmicro
+        run: |
+          npm install
+          npx tsc
+
+      - name: List package contents
+        run: |
+          echo "=== pgmicro (main) ==="
+          ls -la npm/pgmicro/dist/ || true
+          echo "=== darwin-arm64 ==="
+          ls -la npm/darwin-arm64/
+          echo "=== linux-x64-gnu ==="
+          ls -la npm/linux-x64-gnu/
+          echo "=== linux-arm64-gnu ==="
+          ls -la npm/linux-arm64-gnu/
+
+      - name: Dry-run npm pack
+        run: |
+          cd npm/pgmicro && npm pack --dry-run
+          cd ../darwin-arm64 && npm pack --dry-run
+          cd ../linux-x64-gnu && npm pack --dry-run
+          cd ../linux-arm64-gnu && npm pack --dry-run
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgmicro-npm-packages
+          path: |
+            npm/pgmicro/
+            npm/darwin-arm64/
+            npm/linux-x64-gnu/
+            npm/linux-arm64-gnu/
+
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: startsWith(github.ref, 'refs/tags/pgmicro-v')
+    needs:
+      - package
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - uses: actions/download-artifact@v4
+        with:
+          name: pgmicro-npm-packages
+          path: npm/
+      - name: Publish platform packages
+        run: |
+          cd npm/darwin-arm64 && npm publish --access public --provenance || true
+          cd ../linux-x64-gnu && npm publish --access public --provenance || true
+          cd ../linux-arm64-gnu && npm publish --access public --provenance || true
+      - name: Publish main package
+        run: cd npm/pgmicro && npm publish --access public --provenance

@@ -1,10 +1,14 @@
 // pgmicro — PostgreSQL-compatible micro database CLI
-// Standalone binary with PG-style backslash commands.
+// Standalone crate with default-postgres feature for compile-time dialect default.
 #![allow(clippy::arc_with_non_send_sync)]
 
+#[path = "../../cli/config/mod.rs"]
 mod config;
+#[path = "../../cli/helper.rs"]
 mod helper;
+#[path = "../../cli/pg_server.rs"]
 mod pg_server;
+#[path = "../../cli/read_state_machine.rs"]
 mod read_state_machine;
 
 // Stubs for shared modules that reference crate-level types from the tursodb binary.
@@ -41,9 +45,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
-use turso_core::{
-    Connection, Database, DatabaseOpts, LimboError, OpenFlags, SqlDialect, Statement, Value,
-};
+use turso_core::{Connection, Database, DatabaseOpts, LimboError, OpenFlags, Statement, Value};
 
 // ---------------------------------------------------------------------------
 // Statics
@@ -117,7 +119,6 @@ fn open_database(
 
     let (io, db) = Database::open_new(db_path, vfs, flags, db_opts.turso_cli(), None)?;
     let conn = db.connect()?;
-    conn.set_sql_dialect(SqlDialect::Postgres);
     Ok((io, conn))
 }
 
@@ -212,8 +213,6 @@ fn cmd_list_tables(conn: &Arc<Connection>, w: &mut dyn Write) {
 }
 
 fn cmd_describe_table(conn: &Arc<Connection>, table_name: &str, w: &mut dyn Write) {
-    // Join pg_attribute with pg_class and pg_type to get column info.
-    // attnum > 0 filters out system columns.
     let safe_name = table_name.replace('\'', "''");
     let sql = format!(
         "SELECT a.attname, t.typname, a.attnotnull, a.atthasdef, a.attnum \
@@ -363,8 +362,6 @@ fn print_result_set(
 ) -> Result<(), LimboError> {
     let num_columns = stmt.num_columns();
     if num_columns == 0 {
-        // DDL statements (CREATE TABLE, INSERT, etc.) have no result columns
-        // but still need to be stepped to execute the bytecode.
         stmt.run_with_row_callback(|_| Ok(()))?;
         return Ok(());
     }
@@ -514,7 +511,6 @@ impl Repl {
             }
             self.reset_input();
         }
-        // Otherwise keep accumulating (continuation line)
     }
 
     fn run_interactive(&mut self) {
@@ -530,7 +526,6 @@ impl Repl {
             let _ = rl.load_history(HISTORY_FILE.as_path());
         }
 
-        // Load config for syntax highlighting
         let config_file = CONFIG_DIR.join("limbo.toml");
         let config = config::Config::from_config_file(config_file);
         let h = LimboHelper::new(self.conn.clone(), Some(config.highlight.clone()));

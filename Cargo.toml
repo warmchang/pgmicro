@@ -41,7 +41,8 @@ members = [
     "testing/differential-oracle/sql_gen_prop",
     "testing/differential-oracle/sql_gen",
     "testing/differential-oracle/fuzzer",
-    "testing/sqltests"
+    "testing/sqltests",
+    "pgmicro"
 ]
 exclude = ["perf/latency/limbo"]
 
