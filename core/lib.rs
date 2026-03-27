@@ -1979,7 +1979,18 @@ impl<'a> QueryRunner<'a> {
             },
             SqlDialect::Postgres => {
                 let sql = str::from_utf8(statements).unwrap_or("");
-                let stmts = turso_parser_pg::split_statements(sql).unwrap_or_default();
+                let stmts = match turso_parser_pg::split_statements(sql) {
+                    Ok(stmts) if stmts.is_empty() && !sql.trim().is_empty() => {
+                        // split_with_scanner returns empty for invalid SQL;
+                        // pass the original SQL through so parse() surfaces the real error.
+                        vec![sql.trim().to_string()]
+                    }
+                    Ok(stmts) => stmts,
+                    Err(_) => {
+                        // Same fallback: let the parse step produce the error.
+                        vec![sql.trim().to_string()]
+                    }
+                };
                 QueryRunnerInner::Postgres { stmts, index: 0 }
             }
         };

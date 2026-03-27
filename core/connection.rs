@@ -290,14 +290,14 @@ impl Connection {
     /// Parse PostgreSQL SQL using pg_query and translate to Turso AST
     pub(crate) fn parse_postgresql_sql(&self, sql: &str) -> Result<Option<Cmd>> {
         // Parse using pg_query
-        let parse_result = turso_parser_pg::parse(sql)
-            .map_err(|e| LimboError::ParseError(format!("PostgreSQL parse error: {e}")))?;
+        let parse_result =
+            turso_parser_pg::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
 
         // Translate to Turso AST
         let translator = turso_parser_pg::translator::PostgreSQLTranslator::new();
         let stmt = translator
             .translate(&parse_result)
-            .map_err(|e| LimboError::ParseError(format!("PostgreSQL translation error: {e}")))?;
+            .map_err(|e| LimboError::ParseError(e.to_string()))?;
 
         // Wrap in Cmd
         Ok(Some(Cmd::Stmt(stmt)))
