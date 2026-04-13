@@ -5415,7 +5415,7 @@ mod tests {
             if let ast::OneSelect::Select { where_clause, .. } = &select.body.select {
                 let wc = where_clause.as_ref().expect("Expected WHERE clause");
                 if let ast::Expr::FunctionCall { name, args, .. } = &**wc {
-                    assert_eq!(name.as_str(), "pg_array_contains");
+                    assert_eq!(name.as_str(), "array_contains_all");
                     assert_eq!(args.len(), 2);
                 } else {
                     panic!("Expected FunctionCall for @>, got: {wc:?}");
@@ -5438,7 +5438,7 @@ mod tests {
             if let ast::OneSelect::Select { where_clause, .. } = &select.body.select {
                 let wc = where_clause.as_ref().expect("Expected WHERE clause");
                 if let ast::Expr::FunctionCall { name, .. } = &**wc {
-                    assert_eq!(name.as_str(), "pg_array_contained");
+                    assert_eq!(name.as_str(), "array_contains_all");
                 } else {
                     panic!("Expected FunctionCall for <@, got: {wc:?}");
                 }
@@ -5460,7 +5460,7 @@ mod tests {
             if let ast::OneSelect::Select { where_clause, .. } = &select.body.select {
                 let wc = where_clause.as_ref().expect("Expected WHERE clause");
                 if let ast::Expr::FunctionCall { name, .. } = &**wc {
-                    assert_eq!(name.as_str(), "pg_array_overlaps");
+                    assert_eq!(name.as_str(), "array_overlap");
                 } else {
                     panic!("Expected FunctionCall for &&, got: {wc:?}");
                 }
