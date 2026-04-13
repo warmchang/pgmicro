@@ -39,6 +39,7 @@ mod json;
 mod numeric;
 mod parameters;
 mod pg_catalog;
+mod pg_dispatch;
 mod pragma;
 mod progress;
 mod pseudo;
