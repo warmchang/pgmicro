@@ -105,8 +105,8 @@ impl PostgreSQLTranslator {
             NodeRef::ViewStmt(view) => self.translate_create_view(view),
             NodeRef::CreateEnumStmt(enum_stmt) => translate_create_enum(enum_stmt),
             _ => Err(ParseError::ParseError(format!(
-                "Unsupported statement type: {:?}",
-                node.0
+                "{} is not supported",
+                node_ref_name(&node.0)
             ))),
         }
     }
@@ -547,17 +547,30 @@ impl PostgreSQLTranslator {
                     new: col,
                 }
             }
-            // SET/DROP DEFAULT, SET/DROP NOT NULL — these are common in PG migrations
-            // but not directly supported in SQLite. Accept silently as no-ops.
-            AlterTableType::AtColumnDefault
-            | AlterTableType::AtDropNotNull
-            | AlterTableType::AtSetNotNull => {
-                // Return a no-op: rename the table to itself (effectively no change)
-                ast::AlterTableBody::RenameTo(name.name.clone())
+            AlterTableType::AtColumnDefault => {
+                return Err(ParseError::ParseError(
+                    "ALTER COLUMN SET/DROP DEFAULT is not supported".into(),
+                ));
+            }
+            AlterTableType::AtDropNotNull => {
+                return Err(ParseError::ParseError(
+                    "ALTER COLUMN DROP NOT NULL is not supported".into(),
+                ));
+            }
+            AlterTableType::AtSetNotNull => {
+                return Err(ParseError::ParseError(
+                    "ALTER COLUMN SET NOT NULL is not supported".into(),
+                ));
+            }
+            AlterTableType::AtAddConstraint => {
+                return Err(ParseError::ParseError(
+                    "ALTER TABLE ADD CONSTRAINT is not supported".into(),
+                ));
             }
             _ => {
                 return Err(ParseError::ParseError(format!(
-                    "Unsupported ALTER TABLE subtype: {subtype:?}"
+                    "ALTER TABLE {} is not supported",
+                    alter_subtype_name(subtype)
                 )));
             }
         };
@@ -640,16 +653,12 @@ impl PostgreSQLTranslator {
                     conflict_clause: None,
                 }),
                 ConstrType::ConstrUnique => Some(ast::ColumnConstraint::Unique(None)),
-                ConstrType::ConstrDefault => {
-                    match constraint.raw_expr.as_ref() {
-                        Some(raw_expr) => {
-                            Some(ast::ColumnConstraint::Default(Box::new(
-                                self.translate_expr(raw_expr)?,
-                            )))
-                        }
-                        None => None,
-                    }
-                }
+                ConstrType::ConstrDefault => match constraint.raw_expr.as_ref() {
+                    Some(raw_expr) => Some(ast::ColumnConstraint::Default(Box::new(
+                        self.translate_expr(raw_expr)?,
+                    ))),
+                    None => None,
+                },
                 _ => None,
             };
             if let Some(c) = constraint_ast {
@@ -763,6 +772,22 @@ impl PostgreSQLTranslator {
                     ),
                 }
             }
+            Some(Node::String(s)) => {
+                ast::QualifiedName::single(ast::Name::from_string(s.sval.clone()))
+            }
+            Some(Node::TypeName(tn)) => {
+                // DROP TYPE uses TypeName nodes; extract the last name component
+                let type_name = tn
+                    .names
+                    .iter()
+                    .filter_map(|n| match &n.node {
+                        Some(Node::String(s)) => Some(s.sval.clone()),
+                        _ => None,
+                    })
+                    .next_back()
+                    .ok_or_else(|| ParseError::ParseError("DROP TYPE: empty type name".into()))?;
+                ast::QualifiedName::single(ast::Name::from_string(type_name))
+            }
             _ => {
                 return Err(ParseError::ParseError(
                     "DROP: unexpected object format".into(),
@@ -783,8 +808,13 @@ impl PostgreSQLTranslator {
                 if_exists: drop.missing_ok,
                 view_name: qualified_name,
             }),
+            ObjectType::ObjectType => Ok(ast::Stmt::DropType {
+                if_exists: drop.missing_ok,
+                type_name: qualified_name.name.as_str().to_string(),
+            }),
             _ => Err(ParseError::ParseError(format!(
-                "DROP: unsupported object type {remove_type:?}"
+                "DROP {} is not supported",
+                drop_object_type_name(remove_type)
             ))),
         }
     }
@@ -3695,9 +3725,7 @@ fn deparse_default_expr(node: &pg_query::protobuf::Node) -> Option<String> {
             let func_name = name.join(".");
             // Strip pg_catalog schema prefix — functions are registered
             // without it.
-            let func_name = func_name
-                .strip_prefix("pg_catalog.")
-                .unwrap_or(&func_name);
+            let func_name = func_name.strip_prefix("pg_catalog.").unwrap_or(&func_name);
             let args: Vec<String> = func_call
                 .args
                 .iter()
@@ -3755,6 +3783,45 @@ fn similar_to_regex(pattern: &str) -> String {
     }
     regex.push('$');
     regex
+}
+
+/// Converts a CamelCase identifier to UPPER CASE SQL keywords.
+/// e.g. "CreateExtension" → "CREATE EXTENSION", "AlterRole" → "ALTER ROLE"
+fn camel_to_sql(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() + 4);
+    for ch in s.chars() {
+        if ch.is_uppercase() && !result.is_empty() {
+            result.push(' ');
+        }
+        result.push(ch.to_ascii_uppercase());
+    }
+    result
+}
+
+/// Returns a human-readable SQL name for a `NodeRef` statement type.
+/// Strips the "Stmt" suffix and converts CamelCase → "CREATE EXTENSION" etc.
+fn node_ref_name(node: &NodeRef) -> String {
+    let debug = format!("{node:?}");
+    let variant = debug.split('(').next().unwrap_or("unknown");
+    camel_to_sql(variant.trim_end_matches("Stmt"))
+}
+
+/// Returns a human-readable name for an `AlterTableType` variant.
+/// Strips the "At" prefix and converts CamelCase → SQL words.
+fn alter_subtype_name(subtype: pg_query::protobuf::AlterTableType) -> String {
+    let debug = format!("{subtype:?}");
+    let trimmed = debug.strip_prefix("At").unwrap_or(&debug);
+    camel_to_sql(trimmed)
+}
+
+/// Returns a human-readable name for a `DROP` object type.
+/// Strips the "Object" prefix and uppercases.
+fn drop_object_type_name(obj_type: pg_query::protobuf::ObjectType) -> String {
+    let debug = format!("{obj_type:?}");
+    debug
+        .strip_prefix("Object")
+        .unwrap_or(&debug)
+        .to_ascii_uppercase()
 }
 
 #[cfg(test)]
@@ -5376,22 +5443,27 @@ mod tests {
     }
 
     #[test]
-    fn test_alter_table_set_not_null_noop() {
+    fn test_alter_table_set_not_null_unsupported() {
         let translator = PostgreSQLTranslator::new();
         let sql = "ALTER TABLE users ALTER COLUMN name SET NOT NULL";
         let parsed = crate::parse(sql).unwrap();
-        let translated = translator.translate(&parsed).unwrap();
-        // Should succeed (accepted as no-op)
-        assert!(matches!(translated, ast::Stmt::AlterTable(_)));
+        let err = translator.translate(&parsed).unwrap_err();
+        assert!(
+            err.to_string().contains("not supported"),
+            "expected unsupported error, got: {err}"
+        );
     }
 
     #[test]
-    fn test_alter_table_set_default_noop() {
+    fn test_alter_table_set_default_unsupported() {
         let translator = PostgreSQLTranslator::new();
         let sql = "ALTER TABLE users ALTER COLUMN created_at SET DEFAULT now()";
         let parsed = crate::parse(sql).unwrap();
-        let translated = translator.translate(&parsed).unwrap();
-        assert!(matches!(translated, ast::Stmt::AlterTable(_)));
+        let err = translator.translate(&parsed).unwrap_err();
+        assert!(
+            err.to_string().contains("not supported"),
+            "expected unsupported error, got: {err}"
+        );
     }
 
     #[test]

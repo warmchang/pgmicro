@@ -1906,6 +1906,41 @@ fn test_postgres_enum_label_with_spaces(db: TempDatabase) {
     assert_eq!(rows.row().unwrap().get_value(0).to_string(), "sign up");
 }
 
+#[turso_macros::test(mvcc)]
+fn test_postgres_drop_type(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    conn.execute("CREATE TYPE mood AS ENUM ('happy', 'sad')")
+        .unwrap();
+    conn.execute("CREATE TABLE people (name TEXT, m mood)")
+        .unwrap();
+    conn.execute("INSERT INTO people VALUES ('Alice', 'happy')")
+        .unwrap();
+
+    // Drop the table first (type is in use)
+    conn.execute("DROP TABLE people").unwrap();
+    conn.execute("DROP TYPE mood").unwrap();
+
+    // Type should no longer exist — creating a table with it should fail
+    let result = conn.execute("CREATE TABLE people2 (name TEXT, m mood)");
+    assert!(result.is_err(), "expected error using dropped type");
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_drop_type_if_exists(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    // Should not error on nonexistent type
+    conn.execute("DROP TYPE IF EXISTS nonexistent").unwrap();
+
+    // Create then drop
+    conn.execute("CREATE TYPE color AS ENUM ('red', 'blue')")
+        .unwrap();
+    conn.execute("DROP TYPE IF EXISTS color").unwrap();
+}
+
 #[turso_macros::test]
 fn test_postgres_similar_to(db: TempDatabase) {
     let conn = db.connect_limbo();
@@ -2517,8 +2552,7 @@ fn test_postgres_default_now(db: TempDatabase) {
     )
     .unwrap();
 
-    conn.execute("INSERT INTO events (id) VALUES (1)")
-        .unwrap();
+    conn.execute("INSERT INTO events (id) VALUES (1)").unwrap();
 
     let mut stmt = conn
         .prepare("SELECT created_at FROM events WHERE id = 1")
@@ -2528,14 +2562,13 @@ fn test_postgres_default_now(db: TempDatabase) {
     };
     let row = stmt.row().unwrap();
     let Value::Text(ts) = row.get_value(0) else {
-        panic!("expected text value for created_at, got {:?}", row.get_value(0));
+        panic!(
+            "expected text value for created_at, got {:?}",
+            row.get_value(0)
+        );
     };
     // Should be a timestamp like "2024-01-15 14:30:45.123"
-    assert!(
-        ts.value.len() >= 19,
-        "timestamp too short: '{}'",
-        ts.value
-    );
+    assert!(ts.value.len() >= 19, "timestamp too short: '{}'", ts.value);
     assert!(
         ts.value.contains('-') && ts.value.contains(':'),
         "timestamp format wrong: '{}'",
@@ -2556,10 +2589,8 @@ fn test_postgres_default_gen_random_uuid(db: TempDatabase) {
     )
     .unwrap();
 
-    conn.execute("INSERT INTO tokens (id) VALUES (1)")
-        .unwrap();
-    conn.execute("INSERT INTO tokens (id) VALUES (2)")
-        .unwrap();
+    conn.execute("INSERT INTO tokens (id) VALUES (1)").unwrap();
+    conn.execute("INSERT INTO tokens (id) VALUES (2)").unwrap();
 
     let mut stmt = conn
         .prepare("SELECT token FROM tokens ORDER BY id")
@@ -2608,9 +2639,7 @@ fn test_postgres_default_clock_timestamp(db: TempDatabase) {
 
     conn.execute("INSERT INTO logs (id) VALUES (1)").unwrap();
 
-    let mut stmt = conn
-        .prepare("SELECT ts FROM logs WHERE id = 1")
-        .unwrap();
+    let mut stmt = conn.prepare("SELECT ts FROM logs WHERE id = 1").unwrap();
     let StepResult::Row = stmt.step().unwrap() else {
         panic!("expected row");
     };
@@ -2618,11 +2647,7 @@ fn test_postgres_default_clock_timestamp(db: TempDatabase) {
     let Value::Text(ts) = row.get_value(0) else {
         panic!("expected text value for ts");
     };
-    assert!(
-        ts.value.len() >= 19,
-        "timestamp too short: '{}'",
-        ts.value
-    );
+    assert!(ts.value.len() >= 19, "timestamp too short: '{}'", ts.value);
 }
 
 /// Tests DEFAULT transaction_timestamp() and statement_timestamp() work.
@@ -2674,7 +2699,11 @@ fn test_postgres_select_now_and_uuid(db: TempDatabase) {
     let Value::Text(ts) = row.get_value(0) else {
         panic!("expected text from now()");
     };
-    assert!(ts.value.len() >= 19, "now() result too short: '{}'", ts.value);
+    assert!(
+        ts.value.len() >= 19,
+        "now() result too short: '{}'",
+        ts.value
+    );
     drop(stmt);
 
     // SELECT gen_random_uuid()
@@ -2686,7 +2715,12 @@ fn test_postgres_select_now_and_uuid(db: TempDatabase) {
     let Value::Text(uuid) = row.get_value(0) else {
         panic!("expected text from gen_random_uuid()");
     };
-    assert_eq!(uuid.value.split('-').count(), 5, "UUID format wrong: '{}'", uuid.value);
+    assert_eq!(
+        uuid.value.split('-').count(),
+        5,
+        "UUID format wrong: '{}'",
+        uuid.value
+    );
 }
 
 /// Tests multiple DEFAULT functions in the same table.
@@ -2704,8 +2738,7 @@ fn test_postgres_default_multiple_functions(db: TempDatabase) {
     )
     .unwrap();
 
-    conn.execute("INSERT INTO records (id) VALUES (1)")
-        .unwrap();
+    conn.execute("INSERT INTO records (id) VALUES (1)").unwrap();
 
     let mut stmt = conn
         .prepare("SELECT uuid, created, status FROM records WHERE id = 1")
@@ -2749,8 +2782,7 @@ fn test_postgres_default_casted_expression(db: TempDatabase) {
     )
     .unwrap();
 
-    conn.execute("INSERT INTO config (id) VALUES (1)")
-        .unwrap();
+    conn.execute("INSERT INTO config (id) VALUES (1)").unwrap();
 
     let mut stmt = conn
         .prepare("SELECT data, tags, name FROM config WHERE id = 1")
@@ -2763,12 +2795,18 @@ fn test_postgres_default_casted_expression(db: TempDatabase) {
     let Value::Text(data) = row.get_value(0) else {
         panic!("expected text for data, got {:?}", row.get_value(0));
     };
-    assert_eq!(data.value, "{}", "casted default '{{}}'::jsonb should produce '{{}}'");
+    assert_eq!(
+        data.value, "{}",
+        "casted default '{{}}'::jsonb should produce '{{}}'"
+    );
 
     let Value::Text(tags) = row.get_value(1) else {
         panic!("expected text for tags, got {:?}", row.get_value(1));
     };
-    assert_eq!(tags.value, "[]", "casted default '[]'::jsonb should produce '[]'");
+    assert_eq!(
+        tags.value, "[]",
+        "casted default '[]'::jsonb should produce '[]'"
+    );
 
     let Value::Text(name) = row.get_value(2) else {
         panic!("expected text for name, got {:?}", row.get_value(2));
