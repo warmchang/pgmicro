@@ -33,7 +33,7 @@ jobs:
             target: aarch64-apple-darwin
             build: |
               cd bindings/javascript
-              npx napi build --platform --features default-postgres \
+              npx napi build --platform --esm --features default-postgres \
                 --profile release-official \
                 --manifest-path ../../bindings/javascript/Cargo.toml \
                 --output-dir ../../npm/pgmicro \
@@ -44,7 +44,7 @@ jobs:
             docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
             build: |
               cd bindings/javascript
-              npx napi build --platform --features default-postgres \
+              npx napi build --platform --esm --features default-postgres \
                 --profile release-official \
                 --manifest-path ../../bindings/javascript/Cargo.toml \
                 --output-dir ../../npm/pgmicro \
@@ -55,7 +55,7 @@ jobs:
             docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian-aarch64
             build: |
               cd bindings/javascript
-              npx napi build --platform --features default-postgres \
+              npx napi build --platform --esm --features default-postgres \
                 --profile release-official \
                 --manifest-path ../../bindings/javascript/Cargo.toml \
                 --output-dir ../../npm/pgmicro \
@@ -116,6 +116,36 @@ jobs:
           path: npm/pgmicro/pgmicro.*.node
           if-no-files-found: error
 
+  test-napi:
+    name: Test NAPI bindings
+    needs: [build-napi]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install JS dependencies
+        working-directory: bindings/javascript
+        run: yarn install
+      - name: Build database-common
+        working-directory: bindings/javascript
+        run: yarn workspace @tursodatabase/database-common build
+      - name: Download linux-x64 NAPI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: pgmicro-napi-x86_64-unknown-linux-gnu
+          path: npm/pgmicro/
+      - name: Install pgmicro deps and compile TS
+        working-directory: npm/pgmicro
+        run: |
+          npm install
+          npx tsc
+      - name: Run tests
+        working-directory: npm/pgmicro
+        run: npx vitest --run
+
   build-cli:
     name: CLI ${{ matrix.settings.target }}
     timeout-minutes: 30
@@ -165,6 +195,7 @@ jobs:
     needs:
       - build-napi
       - build-cli
+      - test-napi
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
