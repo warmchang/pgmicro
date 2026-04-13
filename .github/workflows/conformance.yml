@@ -4,10 +4,10 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - main
+      - turso-only
   pull_request:
     branches:
-      - main
+      - turso-only
 
 env:
   CARGO_INCREMENTAL: "0"

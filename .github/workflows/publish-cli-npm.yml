@@ -1,8 +1,7 @@
 name: Publish Turso CLI to npm
 
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
 
 jobs:
   publish:

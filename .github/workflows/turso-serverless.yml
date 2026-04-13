@@ -3,15 +3,9 @@ name: turso-serverless
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
-    paths:
-      - 'serverless/javascript/**'
-      - '.github/workflows/turso-serverless.yml'
+    branches: [turso-only]
   pull_request:
-    branches: [ main ]
-    paths:
-      - 'serverless/javascript/**'
-      - '.github/workflows/turso-serverless.yml'
+    branches: [turso-only]
 
 env:
   working-directory: serverless/javascript
