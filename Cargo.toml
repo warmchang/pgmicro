@@ -132,6 +132,7 @@ lto = "thin"
 inherits = "release"
 codegen-units = 1
 lto = true
+strip = true
 
 # override settings for sdk-kit release profiles in order to reduce size of produced binaries
 # otherwise, some platforms will have enormous libs (150MB+)
