@@ -2611,80 +2611,14 @@ impl PostgreSQLTranslator {
             None
         };
 
-        // Map PG function names to SQLite equivalents
-        let mapped_name = match func_name.to_lowercase().as_str() {
-            "pg_catalog.now" => "now".to_string(),
-            "pg_catalog.transaction_timestamp" => "transaction_timestamp".to_string(),
-            "pg_catalog.statement_timestamp" => "statement_timestamp".to_string(),
-            "concat" => {
-                // concat(a, b, c) → a || b || c
-                if args.len() >= 2 {
-                    let mut result = *args[0].clone();
-                    for arg in &args[1..] {
-                        result =
-                            ast::Expr::Binary(Box::new(result), ast::Operator::Concat, arg.clone());
-                    }
-                    return Ok(result);
-                }
-                func_name
-            }
-            "concat_ws" => {
-                // concat_ws(sep, a, b) → a || sep || b
-                // Simple mapping: ignore NULLs semantics
-                if args.len() >= 3 {
-                    let sep = &args[0];
-                    let mut result = *args[1].clone();
-                    for arg in &args[2..] {
-                        result = ast::Expr::Binary(
-                            Box::new(result),
-                            ast::Operator::Concat,
-                            Box::new(ast::Expr::Binary(
-                                sep.clone(),
-                                ast::Operator::Concat,
-                                arg.clone(),
-                            )),
-                        );
-                    }
-                    return Ok(result);
-                }
-                func_name
-            }
-            "string_agg" => "group_concat".to_string(),
-            "array_agg" => "group_concat".to_string(),
-            "chr" => "char".to_string(),
-            "strpos" => "instr".to_string(),
-            "lpad" | "rpad" => func_name,
-            "substring" | "substr" => "substr".to_string(),
-            "btrim" => "trim".to_string(),
-            "ltrim" => "ltrim".to_string(),
-            "rtrim" => "rtrim".to_string(),
-            "char_length" | "character_length" => "length".to_string(),
-            "octet_length" => "length".to_string(),
-            "position" => "instr".to_string(),
-            "md5" | "encode" | "decode" => {
-                // Crypto functions — pass through (may be available as extension)
-                func_name
-            }
-            "extract" => {
-                // EXTRACT(field FROM source) is parsed as a regular function call
-                // by pg_query. The first arg is a string constant with the field name.
-                // Map to strftime.
-                func_name
-            }
-            "to_char" | "to_number" | "to_date" | "to_timestamp" => {
-                // PG formatting functions — pass through
-                func_name
-            }
-            "random" => {
-                // PG random() returns 0.0 to 1.0, SQLite random() returns int
-                // Map to abs(random()) / 9223372036854775807.0 for compatibility
-                func_name
-            }
-            _ => func_name,
-        };
+        // Strip pg_catalog. schema prefix from function names
+        let func_name = func_name
+            .strip_prefix("pg_catalog.")
+            .unwrap_or(&func_name)
+            .to_string();
 
         Ok(ast::Expr::FunctionCall {
-            name: ast::Name::from_string(mapped_name),
+            name: ast::Name::from_string(func_name),
             distinctness,
             args,
             order_by: vec![],
@@ -5415,7 +5349,7 @@ mod tests {
     }
 
     #[test]
-    fn test_function_mapping_string_agg() {
+    fn test_function_passthrough_string_agg() {
         let translator = PostgreSQLTranslator::new();
         let sql = "SELECT string_agg(name, ', ') FROM users";
         let parsed = crate::parse(sql).unwrap();
@@ -5425,7 +5359,11 @@ mod tests {
             if let ast::OneSelect::Select { columns, .. } = &select.body.select {
                 if let ast::ResultColumn::Expr(expr, _) = &columns[0] {
                     if let ast::Expr::FunctionCall { name, .. } = &**expr {
-                        assert_eq!(name.as_str(), "group_concat");
+                        assert_eq!(
+                            name.as_str(),
+                            "string_agg",
+                            "string_agg should pass through (resolved in core/function.rs)"
+                        );
                     } else {
                         panic!("Expected FunctionCall");
                     }
@@ -5435,7 +5373,7 @@ mod tests {
     }
 
     #[test]
-    fn test_function_mapping_concat() {
+    fn test_function_passthrough_concat() {
         let translator = PostgreSQLTranslator::new();
         let sql = "SELECT concat(a, b, c) FROM t";
         let parsed = crate::parse(sql).unwrap();
@@ -5444,11 +5382,16 @@ mod tests {
         if let ast::Stmt::Select(select) = translated {
             if let ast::OneSelect::Select { columns, .. } = &select.body.select {
                 if let ast::ResultColumn::Expr(expr, _) = &columns[0] {
-                    // concat(a, b, c) → a || b || c (nested Binary Concat)
-                    assert!(
-                        matches!(&**expr, ast::Expr::Binary(_, ast::Operator::Concat, _)),
-                        "Expected concat chain, got: {expr:?}"
-                    );
+                    if let ast::Expr::FunctionCall { name, args, .. } = &**expr {
+                        assert_eq!(
+                            name.as_str(),
+                            "concat",
+                            "concat should pass through (resolved in core/function.rs)"
+                        );
+                        assert_eq!(args.len(), 3);
+                    } else {
+                        panic!("Expected FunctionCall, got: {expr:?}");
+                    }
                 }
             }
         }
@@ -5479,7 +5422,7 @@ mod tests {
     }
 
     #[test]
-    fn test_function_mapping_char_length() {
+    fn test_function_passthrough_char_length() {
         let translator = PostgreSQLTranslator::new();
         let sql = "SELECT char_length(name) FROM t";
         let parsed = crate::parse(sql).unwrap();
@@ -5489,7 +5432,11 @@ mod tests {
             if let ast::OneSelect::Select { columns, .. } = &select.body.select {
                 if let ast::ResultColumn::Expr(expr, _) = &columns[0] {
                     if let ast::Expr::FunctionCall { name, .. } = &**expr {
-                        assert_eq!(name.as_str(), "length");
+                        assert_eq!(
+                            name.as_str(),
+                            "char_length",
+                            "char_length should pass through (resolved in core/function.rs)"
+                        );
                     }
                 }
             }
