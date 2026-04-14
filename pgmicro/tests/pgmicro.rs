@@ -291,3 +291,214 @@ fn default_casted_expression() {
         "expected '[]' from casted default, got: {out}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Meta-commands: \di
+// ---------------------------------------------------------------------------
+
+#[test]
+fn di_lists_created_indexes() {
+    let output = run_pgmicro(
+        b"CREATE TABLE t(id INT PRIMARY KEY, name TEXT);\nCREATE INDEX idx_name ON t(name);\n\\di\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("idx_name"),
+        "\\di should list idx_name, got: {out}"
+    );
+}
+
+#[test]
+fn di_empty_database() {
+    let output = run_pgmicro(b"\\di\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("No indexes found"),
+        "expected 'No indexes found', got: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Meta-commands: \dv
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dv_empty_database() {
+    let output = run_pgmicro(b"\\dv\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("No views found"),
+        "expected 'No views found', got: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Meta-commands: \dn
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dn_lists_schemas() {
+    let output = run_pgmicro(b"\\dn\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("public"),
+        "\\dn should list 'public', got: {out}"
+    );
+}
+
+#[test]
+fn dn_lists_created_schema() {
+    let output = run_pgmicro(b"CREATE SCHEMA foo;\n\\dn\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("foo"), "\\dn should list 'foo', got: {out}");
+}
+
+// ---------------------------------------------------------------------------
+// Meta-commands: \dT
+// ---------------------------------------------------------------------------
+
+#[test]
+fn d_upper_t_lists_types() {
+    let output = run_pgmicro(b"CREATE TYPE mood AS ENUM ('happy', 'sad');\n\\dT\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("mood"), "\\dT should list 'mood', got: {out}");
+}
+
+#[test]
+fn d_upper_t_empty() {
+    let output = run_pgmicro(b"\\dT\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("No types found"),
+        "expected 'No types found', got: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Meta-commands: \du
+// ---------------------------------------------------------------------------
+
+#[test]
+fn du_lists_roles() {
+    let output = run_pgmicro(b"\\du\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("turso"),
+        "\\du should list 'turso', got: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Meta-commands: \df
+// ---------------------------------------------------------------------------
+
+#[test]
+fn df_lists_functions() {
+    let output = run_pgmicro(b"\\df\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("abs") || out.contains("length"),
+        "\\df should list some builtin function, got: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Meta-commands: \d+ (extended describe)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn d_plus_describes_table_extended() {
+    let output = run_pgmicro(
+        b"CREATE TABLE tbl(id INT PRIMARY KEY, name TEXT);\nCREATE INDEX idx_tbl_name ON tbl(name);\n\\d+ tbl\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("id"), "should show column 'id', got: {out}");
+    assert!(
+        out.contains("idx_tbl_name"),
+        "should show index, got: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Meta-commands: \dt+
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dt_plus_lists_tables_extended() {
+    let output = run_pgmicro(b"CREATE TABLE tbl(id INT);\n\\dt+\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("tbl"),
+        "\\dt+ should list table name, got: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Meta-commands: \x
+// ---------------------------------------------------------------------------
+
+#[test]
+fn x_toggles_expanded() {
+    let output = run_pgmicro(b"\\x\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("Expanded display is on"),
+        "expected toggle message, got: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Meta-commands: \timing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn timing_toggles() {
+    let output = run_pgmicro(b"\\timing\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("Timing is on"),
+        "expected timing toggle message, got: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Meta-commands: \echo
+// ---------------------------------------------------------------------------
+
+#[test]
+fn echo_prints_text() {
+    let output = run_pgmicro(b"\\echo hello world\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("hello world"),
+        "expected 'hello world', got: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Meta-commands: \? (updated help)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn help_lists_new_commands() {
+    let output = run_pgmicro(b"\\?\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("\\di"), "help should mention \\di, got: {out}");
+    assert!(out.contains("\\dn"), "help should mention \\dn, got: {out}");
+    assert!(out.contains("\\dT"), "help should mention \\dT, got: {out}");
+}
