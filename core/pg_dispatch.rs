@@ -11,8 +11,8 @@ use crate::connection::Connection;
 use crate::statement::StatementOrigin;
 use crate::{Cmd, LimboError, Result, SqlDialect, Statement, Value};
 use turso_parser_pg::translator::{
-    try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
-    PgCreateSchemaStmt, PgDropSchemaStmt, PostgreSQLTranslator,
+    is_refresh_matview, try_extract_create_schema, try_extract_drop_schema, try_extract_set,
+    try_extract_show, PgCreateSchemaStmt, PgDropSchemaStmt, PostgreSQLTranslator,
 };
 
 use crate::sync::Arc;
@@ -62,6 +62,11 @@ impl Connection {
         // DROP SCHEMA → DROP tables + DETACH database
         if let Some(ds) = try_extract_drop_schema(&parse_result) {
             self.handle_pg_drop_schema(&ds)?;
+            return Ok(Some(self.prepare_sqlite_sql("SELECT 0 WHERE 0")?));
+        }
+
+        // REFRESH MATERIALIZED VIEW → no-op (Turso matviews are live)
+        if is_refresh_matview(&parse_result) {
             return Ok(Some(self.prepare_sqlite_sql("SELECT 0 WHERE 0")?));
         }
 

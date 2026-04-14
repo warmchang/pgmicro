@@ -103,6 +103,7 @@ impl PostgreSQLTranslator {
             NodeRef::CreateStmt(create) => self.translate_create_table(create),
             NodeRef::TruncateStmt(truncate) => self.translate_truncate(truncate),
             NodeRef::ViewStmt(view) => self.translate_create_view(view),
+            NodeRef::CreateTableAsStmt(ctas) => self.translate_create_table_as(ctas),
             NodeRef::CreateEnumStmt(enum_stmt) => translate_create_enum(enum_stmt),
             _ => Err(ParseError::ParseError(format!(
                 "{} is not supported",
@@ -804,7 +805,7 @@ impl PostgreSQLTranslator {
                 if_exists: drop.missing_ok,
                 idx_name: qualified_name,
             }),
-            ObjectType::ObjectView => Ok(ast::Stmt::DropView {
+            ObjectType::ObjectView | ObjectType::ObjectMatview => Ok(ast::Stmt::DropView {
                 if_exists: drop.missing_ok,
                 view_name: qualified_name,
             }),
@@ -886,6 +887,68 @@ impl PostgreSQLTranslator {
         Ok(ast::Stmt::CreateView {
             temporary: false,
             if_not_exists: false,
+            view_name,
+            columns,
+            select,
+        })
+    }
+
+    /// Translate CREATE MATERIALIZED VIEW (parsed by PG as CreateTableAsStmt
+    /// with objtype = ObjectMatview).
+    fn translate_create_table_as(
+        &self,
+        ctas: &pg_query::protobuf::CreateTableAsStmt,
+    ) -> Result<ast::Stmt, ParseError> {
+        use pg_query::protobuf::ObjectType;
+
+        let objtype = ObjectType::try_from(ctas.objtype)
+            .map_err(|_| ParseError::ParseError("CREATE TABLE AS: invalid object type".into()))?;
+
+        if objtype != ObjectType::ObjectMatview {
+            return Err(ParseError::ParseError(
+                "CREATE TABLE AS SELECT is not supported; use CREATE MATERIALIZED VIEW".into(),
+            ));
+        }
+
+        let into_clause = ctas.into.as_ref().ok_or_else(|| {
+            ParseError::ParseError("CREATE MATERIALIZED VIEW: missing INTO clause".into())
+        })?;
+
+        let relation = into_clause.rel.as_ref().ok_or_else(|| {
+            ParseError::ParseError("CREATE MATERIALIZED VIEW: missing view name".into())
+        })?;
+        let view_name = self.qualified_name_from_range_var(relation);
+
+        // Column aliases from the INTO clause
+        let columns: Vec<ast::IndexedColumn> = into_clause
+            .col_names
+            .iter()
+            .filter_map(|node| match &node.node {
+                Some(pg_query::protobuf::node::Node::String(s)) => Some(ast::IndexedColumn {
+                    col_name: ast::Name::from_string(&s.sval),
+                    collation_name: None,
+                    order: None,
+                }),
+                _ => None,
+            })
+            .collect();
+
+        // Translate the query
+        let query_node = ctas.query.as_ref().ok_or_else(|| {
+            ParseError::ParseError("CREATE MATERIALIZED VIEW: missing query".into())
+        })?;
+        let select_stmt = match &query_node.node {
+            Some(pg_query::protobuf::node::Node::SelectStmt(s)) => s,
+            _ => {
+                return Err(ParseError::ParseError(
+                    "CREATE MATERIALIZED VIEW: expected SELECT statement".into(),
+                ));
+            }
+        };
+        let select = self.translate_select(select_stmt)?;
+
+        Ok(ast::Stmt::CreateMaterializedView {
+            if_not_exists: ctas.if_not_exists,
             view_name,
             columns,
             select,
@@ -3669,6 +3732,18 @@ pub fn try_extract_drop_schema(parse_result: &ParseResult) -> Option<PgDropSchem
     })
 }
 
+/// Returns true if the parse result is a REFRESH MATERIALIZED VIEW statement.
+/// Turso materialized views are live (auto-updating), so REFRESH is a no-op.
+pub fn is_refresh_matview(parse_result: &ParseResult) -> bool {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return false;
+    }
+    matches!(&nodes[0].0, NodeRef::RefreshMatViewStmt(_))
+}
+
 /// Parse a SQL referential action string to an AST RefAct.
 fn parse_ref_act(action: &str) -> Option<ast::RefAct> {
     match action.to_uppercase().as_str() {
@@ -5652,5 +5727,69 @@ mod tests {
         } else {
             panic!("Expected Select statement");
         }
+    }
+
+    #[test]
+    fn test_create_materialized_view() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "CREATE MATERIALIZED VIEW totals AS SELECT category, SUM(price) FROM products GROUP BY category";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        match translated {
+            ast::Stmt::CreateMaterializedView {
+                if_not_exists,
+                view_name,
+                ..
+            } => {
+                assert!(!if_not_exists);
+                assert_eq!(view_name.name.as_str(), "totals");
+            }
+            other => panic!("Expected CreateMaterializedView, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_create_materialized_view_if_not_exists() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "CREATE MATERIALIZED VIEW IF NOT EXISTS mv AS SELECT 1";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        match translated {
+            ast::Stmt::CreateMaterializedView { if_not_exists, .. } => {
+                assert!(if_not_exists);
+            }
+            other => panic!("Expected CreateMaterializedView, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_drop_materialized_view() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "DROP MATERIALIZED VIEW my_view";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        match translated {
+            ast::Stmt::DropView {
+                if_exists,
+                view_name,
+            } => {
+                assert!(!if_exists);
+                assert_eq!(view_name.name.as_str(), "my_view");
+            }
+            other => panic!("Expected DropView, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_refresh_materialized_view() {
+        let sql = "REFRESH MATERIALIZED VIEW my_view";
+        let parsed = crate::parse(sql).unwrap();
+        // REFRESH is intercepted in pg_dispatch, but the translator should not error
+        // if it encounters it — it falls to the catch-all arm.
+        // For this test, just verify parsing succeeds.
+        assert!(!parsed.protobuf.nodes().is_empty());
     }
 }
