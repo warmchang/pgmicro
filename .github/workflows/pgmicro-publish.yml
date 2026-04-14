@@ -152,13 +152,9 @@ jobs:
           name: pgmicro-npm-packages
           path: npm/
       - name: Publish platform packages
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           cd npm/darwin-arm64 && npm publish --access public --provenance || true
           cd ../linux-x64-gnu && npm publish --access public --provenance || true
           cd ../linux-arm64-gnu && npm publish --access public --provenance || true
       - name: Publish main package
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: cd npm/pgmicro && npm publish --access public --provenance
