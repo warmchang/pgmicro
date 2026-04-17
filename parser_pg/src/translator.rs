@@ -2768,6 +2768,27 @@ impl PostgreSQLTranslator {
             .unwrap_or(&func_name)
             .to_string();
 
+        // PG type-cast functions: float8(x) → CAST(x AS REAL), int4(x) → CAST(x AS INTEGER), etc.
+        let cast_type = match func_name.to_uppercase().as_str() {
+            "FLOAT8" | "FLOAT4" => Some("REAL"),
+            "INT4" | "INT2" | "INT8" => Some("INTEGER"),
+            "BOOL" => Some("BOOLEAN"),
+            "TEXT" => Some("TEXT"),
+            _ => None,
+        };
+        if let Some(type_name) = cast_type {
+            if args.len() == 1 {
+                return Ok(ast::Expr::Cast {
+                    expr: args.into_iter().next().unwrap(),
+                    type_name: Some(ast::Type {
+                        name: type_name.to_string(),
+                        size: None,
+                        array_dimensions: 0,
+                    }),
+                });
+            }
+        }
+
         Ok(ast::Expr::FunctionCall {
             name: ast::Name::from_string(func_name),
             distinctness,
