@@ -141,15 +141,23 @@ pub fn exec_lpad(input: &Value, length: usize, fill: &str) -> Value {
     }
 }
 
+fn gcd_inner(mut a: i64, mut b: i64) -> i64 {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a.wrapping_abs()
+}
+
 /// Greatest common divisor.
 pub fn exec_gcd(a: i64, b: i64) -> Value {
-    fn gcd_inner(mut a: i64, mut b: i64) -> i64 {
-        while b != 0 {
-            let t = b;
-            b = a % b;
-            a = t;
-        }
-        a.abs()
+    // PG raises ERROR on overflow (gcd(INT_MIN, 0)), we match that
+    if (a == i64::MIN && b == 0) || (b == i64::MIN && a == 0) {
+        return Value::build_text("ERROR: integer out of range");
+    }
+    if a == i64::MIN && b == i64::MIN {
+        return Value::build_text("ERROR: integer out of range");
     }
     Value::from_i64(gcd_inner(a, b))
 }
@@ -159,19 +167,10 @@ pub fn exec_lcm(a: i64, b: i64) -> Value {
     if a == 0 || b == 0 {
         return Value::from_i64(0);
     }
-    fn gcd_inner(mut a: i64, mut b: i64) -> i64 {
-        while b != 0 {
-            let t = b;
-            b = a % b;
-            a = t;
-        }
-        a.abs()
-    }
     let g = gcd_inner(a, b);
-    // Use checked arithmetic to detect overflow like PG does
-    match (a / g).checked_mul(b.abs()) {
-        Some(v) => Value::from_i64(v.abs()),
-        None => Value::from_i64(0), // overflow
+    match (a / g).checked_mul(b.wrapping_abs()) {
+        Some(v) => Value::from_i64(v.wrapping_abs()),
+        None => Value::build_text("ERROR: integer out of range"),
     }
 }
 
