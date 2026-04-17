@@ -1240,6 +1240,35 @@ impl PostgreSQLTranslator {
             return self.translate_set_operation(select);
         }
 
+        // VALUES clause: standalone VALUES (1,'a'), (2,'b') ...
+        if !select.values_lists.is_empty() && select.target_list.is_empty() {
+            let mut rows = Vec::new();
+            for row_node in &select.values_lists {
+                let Some(pg_query::protobuf::node::Node::List(list)) = &row_node.node else {
+                    return Err(ParseError::ParseError(
+                        "VALUES: expected list node".to_string(),
+                    ));
+                };
+                let mut exprs = Vec::new();
+                for item in &list.items {
+                    exprs.push(Box::new(self.translate_expr(item)?));
+                }
+                rows.push(exprs);
+            }
+            let body = ast::SelectBody {
+                select: ast::OneSelect::Values(rows),
+                compounds: vec![],
+            };
+            let order_by = self.translate_order_by(&select.sort_clause)?;
+            let limit = self.translate_limit(&select.limit_count, &select.limit_offset)?;
+            return Ok(ast::Select {
+                with: None,
+                body,
+                order_by,
+                limit,
+            });
+        }
+
         // Regular SELECT — translate FROM, columns, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT
         let from_clause = if !select.from_clause.is_empty() {
             Some(self.translate_from_items(&select.from_clause)?)
@@ -1450,6 +1479,9 @@ impl PostgreSQLTranslator {
                 }
                 Some(pg_query::protobuf::node::Node::RangeFunction(range_func)) => {
                     self.translate_range_function(range_func)?
+                }
+                Some(pg_query::protobuf::node::Node::RangeSubselect(range_sub)) => {
+                    self.translate_range_subselect(range_sub)?
                 }
                 other => {
                     return Err(ParseError::ParseError(format!(
