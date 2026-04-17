@@ -308,13 +308,23 @@ impl PostgreSQLTranslator {
             }
         }
 
-        // Build the type
+        // Build the type with size parameters (e.g. varchar(4), numeric(10,2))
         let col_type = if mapping.type_name.is_empty() {
             None
         } else {
+            let size = match mapping.type_params.as_slice() {
+                [p, s] => Some(ast::TypeSize::TypeSize(
+                    Box::new(ast::Expr::Literal(ast::Literal::Numeric(p.to_string()))),
+                    Box::new(ast::Expr::Literal(ast::Literal::Numeric(s.to_string()))),
+                )),
+                [n] => Some(ast::TypeSize::MaxSize(Box::new(ast::Expr::Literal(
+                    ast::Literal::Numeric(n.to_string()),
+                )))),
+                _ => None,
+            };
             Some(ast::Type {
                 name: mapping.type_name.clone(),
-                size: None,
+                size,
                 array_dimensions: mapping.array_dimensions,
             })
         };
@@ -632,9 +642,19 @@ impl PostgreSQLTranslator {
         let mapping = map_pg_type(&pg_type, &typmods).ok_or_else(|| {
             ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}"))
         })?;
+        let size = match mapping.type_params.as_slice() {
+            [p, s] => Some(ast::TypeSize::TypeSize(
+                Box::new(ast::Expr::Literal(ast::Literal::Numeric(p.to_string()))),
+                Box::new(ast::Expr::Literal(ast::Literal::Numeric(s.to_string()))),
+            )),
+            [n] => Some(ast::TypeSize::MaxSize(Box::new(ast::Expr::Literal(
+                ast::Literal::Numeric(n.to_string()),
+            )))),
+            _ => None,
+        };
         let col_type = Some(ast::Type {
             name: mapping.type_name,
-            size: None,
+            size,
             array_dimensions: mapping.array_dimensions,
         });
 
@@ -3431,11 +3451,13 @@ fn def_elem_bool_val(def: &pg_query::protobuf::DefElem) -> Option<bool> {
     }
 }
 
-/// Result of mapping a PostgreSQL type: the Turso type name and array dimensions.
+/// Result of mapping a PostgreSQL type: the Turso type name, array dimensions,
+/// and type parameters (e.g. `[4]` for `varchar(4)`, `[10, 2]` for `numeric(10, 2)`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PgTypeMapping {
     pub type_name: String,
     pub array_dimensions: u32,
+    pub type_params: Vec<i64>,
 }
 
 impl PgTypeMapping {
@@ -3443,6 +3465,15 @@ impl PgTypeMapping {
         Self {
             type_name: name.into(),
             array_dimensions: 0,
+            type_params: vec![],
+        }
+    }
+
+    pub fn with_params(name: impl Into<String>, params: Vec<i64>) -> Self {
+        Self {
+            type_name: name.into(),
+            array_dimensions: 0,
+            type_params: params,
         }
     }
 
@@ -3450,6 +3481,7 @@ impl PgTypeMapping {
         Self {
             type_name: name.into(),
             array_dimensions: dims,
+            type_params: vec![],
         }
     }
 }
@@ -3476,6 +3508,7 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         return Some(PgTypeMapping {
             type_name: scalar.type_name,
             array_dimensions: scalar.array_dimensions + dims,
+            type_params: scalar.type_params,
         });
     }
 
@@ -3494,16 +3527,20 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         "JSON" => "json".into(),
         "JSONB" => "jsonb".into(),
 
-        // Parametric types
-        "VARCHAR" | "CHAR" => match params.first() {
-            Some(&n) => format!("varchar({n})"),
-            None => "TEXT".into(),
-        },
-        "NUMERIC" | "DECIMAL" => match params {
-            [p, s] => format!("numeric({p},{s})"),
-            [p] => format!("numeric({p},0)"),
-            _ => "REAL".into(),
-        },
+        // Parametric types — return base name + params separately
+        "VARCHAR" | "CHAR" => {
+            return match params.first() {
+                Some(_) => Some(PgTypeMapping::with_params("varchar", params.to_vec())),
+                None => Some(PgTypeMapping::scalar("TEXT")),
+            };
+        }
+        "NUMERIC" | "DECIMAL" => {
+            return match params {
+                [p, s] => Some(PgTypeMapping::with_params("numeric", vec![*p, *s])),
+                [p] => Some(PgTypeMapping::with_params("numeric", vec![*p, 0])),
+                _ => Some(PgTypeMapping::scalar("REAL")),
+            };
+        }
 
         // Base types (no Turso custom type needed)
         "INTEGER" | "INT" | "INT4" | "SERIAL" | "BIGSERIAL" | "SMALLSERIAL" => "INTEGER".into(),
@@ -3533,6 +3570,7 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
     Some(PgTypeMapping {
         type_name,
         array_dimensions: 0,
+        type_params: vec![],
     })
 }
 
@@ -4224,11 +4262,20 @@ mod tests {
         assert_eq!(map_pg_type("JSON", no_params), Some(s("json")));
         assert_eq!(map_pg_type("JSONB", no_params), Some(s("jsonb")));
 
-        // Parametric types
-        assert_eq!(map_pg_type("VARCHAR", &[100]), Some(s("varchar(100)")));
+        // Parametric types — base name + params separated
+        assert_eq!(
+            map_pg_type("VARCHAR", &[100]),
+            Some(PgTypeMapping::with_params("varchar", vec![100]))
+        );
         assert_eq!(map_pg_type("VARCHAR", no_params), Some(s("TEXT")));
-        assert_eq!(map_pg_type("NUMERIC", &[10, 2]), Some(s("numeric(10,2)")));
-        assert_eq!(map_pg_type("NUMERIC", &[10]), Some(s("numeric(10,0)")));
+        assert_eq!(
+            map_pg_type("NUMERIC", &[10, 2]),
+            Some(PgTypeMapping::with_params("numeric", vec![10, 2]))
+        );
+        assert_eq!(
+            map_pg_type("NUMERIC", &[10]),
+            Some(PgTypeMapping::with_params("numeric", vec![10, 0]))
+        );
         assert_eq!(map_pg_type("NUMERIC", no_params), Some(s("REAL")));
 
         // Network types → custom types
@@ -4252,6 +4299,54 @@ mod tests {
             map_pg_type("SOMECUSTOMTYPE", no_params),
             Some(s("somecustomtype"))
         );
+    }
+
+    #[test]
+    fn test_varchar_column_type() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "CREATE TABLE t(f1 varchar(4))";
+        let parse_result = crate::parse(sql).unwrap();
+        let stmt = translator.translate(&parse_result).unwrap();
+        if let ast::Stmt::CreateTable { body, .. } = &stmt {
+            if let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = body {
+                let col = &columns[0];
+                let col_type = col.col_type.as_ref().unwrap();
+                assert_eq!(col_type.name, "varchar");
+                assert!(
+                    matches!(col_type.size, Some(ast::TypeSize::MaxSize(_))),
+                    "expected MaxSize, got {:?}",
+                    col_type.size
+                );
+            } else {
+                panic!("expected ColumnsAndConstraints");
+            }
+        } else {
+            panic!("expected CreateTable, got {stmt:?}");
+        }
+    }
+
+    #[test]
+    fn test_numeric_column_type() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "CREATE TABLE t(f1 numeric(10, 2))";
+        let parse_result = crate::parse(sql).unwrap();
+        let stmt = translator.translate(&parse_result).unwrap();
+        if let ast::Stmt::CreateTable { body, .. } = &stmt {
+            if let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = body {
+                let col = &columns[0];
+                let col_type = col.col_type.as_ref().unwrap();
+                assert_eq!(col_type.name, "numeric");
+                assert!(
+                    matches!(col_type.size, Some(ast::TypeSize::TypeSize(_, _))),
+                    "expected TypeSize, got {:?}",
+                    col_type.size
+                );
+            } else {
+                panic!("expected ColumnsAndConstraints");
+            }
+        } else {
+            panic!("expected CreateTable, got {stmt:?}");
+        }
     }
 
     #[test]
