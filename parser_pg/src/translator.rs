@@ -27,17 +27,23 @@ impl PostgreSQLTranslator {
     ) -> ast::QualifiedName {
         let mapped_name = self.map_table_name(&range_var.relname);
         let name = ast::Name::from_string(mapped_name);
-        if range_var.schemaname.is_empty()
+        let alias = range_var
+            .alias
+            .as_ref()
+            .filter(|a| !a.aliasname.is_empty())
+            .map(|a| ast::Name::from_string(&a.aliasname));
+        let mut qn = if range_var.schemaname.is_empty()
             || matches!(
                 range_var.schemaname.to_lowercase().as_str(),
                 "pg_catalog" | "public" | "information_schema"
-            )
-        {
+            ) {
             ast::QualifiedName::single(name)
         } else {
             let schema = ast::Name::from_string(range_var.schemaname.clone());
             ast::QualifiedName::fullname(schema, name)
-        }
+        };
+        qn.alias = alias;
+        qn
     }
 
     /// Maps PostgreSQL system table names to their Turso equivalents.

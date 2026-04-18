@@ -2813,3 +2813,66 @@ fn test_postgres_default_casted_expression(db: TempDatabase) {
     };
     assert_eq!(name.value, "unnamed");
 }
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_delete_with_alias(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    conn.execute("CREATE TABLE del_test (id INTEGER PRIMARY KEY, a INT)")
+        .unwrap();
+    conn.execute("INSERT INTO del_test VALUES (1, 10)").unwrap();
+    conn.execute("INSERT INTO del_test VALUES (2, 50)").unwrap();
+    conn.execute("INSERT INTO del_test VALUES (3, 100)")
+        .unwrap();
+
+    // DELETE with alias — WHERE references the alias
+    conn.execute("DELETE FROM del_test AS dt WHERE dt.a > 75")
+        .unwrap();
+
+    let mut rows = conn
+        .query("SELECT id, a FROM del_test ORDER BY id")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    assert_eq!(row.get_value(0).to_string(), "1");
+    assert_eq!(row.get_value(1).to_string(), "10");
+
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected second row");
+    };
+    let row = rows.row().unwrap();
+    assert_eq!(row.get_value(0).to_string(), "2");
+    assert_eq!(row.get_value(1).to_string(), "50");
+
+    let StepResult::Done = rows.step().unwrap() else {
+        panic!("expected done after two rows");
+    };
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_update_with_alias(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    conn.execute("CREATE TABLE upd_test (id INTEGER PRIMARY KEY, a INT)")
+        .unwrap();
+    conn.execute("INSERT INTO upd_test VALUES (1, 10)").unwrap();
+    conn.execute("INSERT INTO upd_test VALUES (2, 50)").unwrap();
+
+    // UPDATE with alias — SET and WHERE reference the alias
+    conn.execute("UPDATE upd_test AS ut SET a = ut.a + 1 WHERE ut.id = 1")
+        .unwrap();
+
+    let mut rows = conn
+        .query("SELECT a FROM upd_test WHERE id = 1")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    assert_eq!(rows.row().unwrap().get_value(0).to_string(), "11");
+}
