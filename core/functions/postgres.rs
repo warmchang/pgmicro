@@ -212,19 +212,7 @@ pub fn exec_pg_input_is_valid(input: &Value, type_name: &str) -> Value {
         Value::Null => return Value::Null,
         v => v.to_string(),
     };
-    let valid = match type_name.to_lowercase().as_str() {
-        "int2" | "smallint" => s.trim().parse::<i16>().is_ok(),
-        "int4" | "integer" | "int" => s.trim().parse::<i32>().is_ok(),
-        "int8" | "bigint" => s.trim().parse::<i64>().is_ok(),
-        "float4" | "real" => s.trim().parse::<f32>().is_ok(),
-        "float8" | "double precision" => s.trim().parse::<f64>().is_ok(),
-        "bool" | "boolean" => matches!(
-            s.trim().to_lowercase().as_str(),
-            "t" | "true" | "y" | "yes" | "on" | "1" | "f" | "false" | "n" | "no" | "off" | "0"
-        ),
-        "text" | "varchar" | "char" => true,
-        _ => true, // unknown types: assume valid
-    };
+    let valid = crate::pg_catalog::validate_pg_input(&s, type_name).is_none();
     Value::from_i64(if valid { 1 } else { 0 })
 }
 
