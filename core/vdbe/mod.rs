@@ -17,8 +17,9 @@
 //!
 //! https://www.sqlite.org/opcode.html
 
+use crate::translate::plan::BitSet;
 use crate::types::{Extendable, Text};
-use crate::{turso_assert, turso_assert_ne, turso_debug_assert, HashSet, NonNan};
+use crate::{turso_assert, turso_assert_ne, turso_debug_assert, NonNan};
 pub mod affinity;
 pub mod array;
 pub mod bloom_filter;
@@ -31,6 +32,7 @@ pub mod insn;
 pub mod metrics;
 pub mod rowset;
 pub mod sorter;
+pub mod vacuum;
 pub mod value;
 // for benchmarks
 pub use crate::translate::collate::CollationSeq;
@@ -47,12 +49,13 @@ use crate::{
     vdbe::{
         execute::{
             OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState, OpIdxInsertState,
-            OpInsertState, OpInsertSubState, OpJournalModeState, OpNewRowidState,
-            OpNoConflictState, OpProgramState, OpRowIdState, OpSeekState, OpTransactionState,
-            OpVacuumIntoState,
+            OpInitCdcVersionState, OpInsertState, OpInsertSubState, OpJournalModeState,
+            OpNewRowidState, OpNoConflictState, OpParseSchemaState, OpProgramState, OpRowIdState,
+            OpSeekState, OpTransactionState, VacuumIntoOpContext,
         },
         hash_table::HashTable,
         metrics::StatementMetrics,
+        vacuum::VacuumInPlaceOpContext,
     },
     ValueRef,
 };
@@ -106,34 +109,14 @@ pub enum ViewDeltaCommitState {
     Done,
 }
 
-/// We use labels to indicate that we want to jump to whatever the instruction offset
-/// will be at runtime, because the offset cannot always be determined when the jump
-/// instruction is created.
-///
-/// In some cases, we want to jump to EXACTLY a specific instruction.
-/// - Example: a condition is not met, so we want to jump to wherever Halt is.
-///
-/// In other cases, we don't care what the exact instruction is, but we know that we
-/// want to jump to whatever comes AFTER a certain instruction.
-/// - Example: a Next instruction will want to jump to "whatever the start of the loop is",
-///   but it doesn't care what instruction that is.
-///
-/// The reason this distinction is important is that we might reorder instructions that are
-/// constant at compile time, and when we do that, we need to change the offsets of any impacted
-/// jump instructions, so the instruction that comes immediately after "next Insn" might have changed during the reordering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum JumpTarget {
-    ExactlyThisInsn,
-    AfterThisInsn,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// Represents a target for a jump instruction.
 /// Stores 32-bit ints to keep the enum word-sized.
 pub enum BranchOffset {
     /// A label is a named location in the program.
     /// If there are references to it, it must always be resolved to an Offset
-    /// via program.resolve_label().
+    /// via `ProgramBuilder::preassign_label_to_next_insn` or
+    /// `ProgramBuilder::link_label_to_other_label`.
     Label(u32),
     /// An offset is a direct index into the instruction list.
     Offset(InsnReference),
@@ -143,11 +126,6 @@ pub enum BranchOffset {
 }
 
 impl BranchOffset {
-    /// Returns true if the branch offset is a label.
-    pub fn is_label(&self) -> bool {
-        matches!(self, BranchOffset::Label(_))
-    }
-
     /// Returns true if the branch offset is an offset.
     pub fn is_offset(&self) -> bool {
         matches!(self, BranchOffset::Offset(_))
@@ -171,19 +149,6 @@ impl BranchOffset {
             BranchOffset::Offset(v) => *v as i32,
             BranchOffset::Placeholder => i32::MAX,
         }
-    }
-
-    /// Adds an integer value to the branch offset.
-    /// Returns a new branch offset.
-    /// Panics if the branch offset is a label or placeholder.
-    #[allow(clippy::should_implement_trait)]
-    pub fn add<N: Into<u32>>(self, n: N) -> BranchOffset {
-        BranchOffset::Offset(self.as_offset_int() + n.into())
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    pub fn sub<N: Into<u32>>(self, n: N) -> BranchOffset {
-        BranchOffset::Offset(self.as_offset_int() - n.into())
     }
 }
 
@@ -217,11 +182,11 @@ enum CommitState {
     /// Committing attached database pagers after main pager commit is done.
     CommittingAttached,
     CommittingMvcc {
-        state_machine: StateMachine<CommitStateMachine<MvccClock>>,
+        state_machine: StateMachine<Box<CommitStateMachine<MvccClock>>>,
     },
     /// Committing MVCC transactions on attached databases after main MVCC commit is done.
     CommittingAttachedMvcc {
-        state_machine: StateMachine<CommitStateMachine<MvccClock>>,
+        state_machine: StateMachine<Box<CommitStateMachine<MvccClock>>>,
         db_id: usize,
         mv_store: Arc<MvStore>,
     },
@@ -236,7 +201,7 @@ pub enum Register {
 
 impl Register {
     #[inline]
-    pub fn is_null(&self) -> bool {
+    pub const fn is_null(&self) -> bool {
         matches!(self, Register::Value(Value::Null))
     }
 
@@ -372,13 +337,13 @@ pub enum ProgramExecutionState {
 }
 
 impl ProgramExecutionState {
-    pub fn is_running(&self) -> bool {
+    pub const fn is_running(&self) -> bool {
         matches!(
             self,
             ProgramExecutionState::Interrupting | ProgramExecutionState::Running
         )
     }
-    pub fn is_terminal(&self) -> bool {
+    pub const fn is_terminal(&self) -> bool {
         matches!(
             self,
             ProgramExecutionState::Interrupted
@@ -417,10 +382,196 @@ pub struct OpHashProbeState {
     pub probe_buffered: bool,
 }
 
+enum ActiveOpState {
+    None,
+    Delete(OpDeleteState),
+    Destroy(OpDestroyState),
+    IdxDelete(Option<OpIdxDeleteState>),
+    IntegrityCheck(OpIntegrityCheckState),
+    OpenEphemeral(OpOpenEphemeralState),
+    Program(OpProgramState),
+    NewRowid(OpNewRowidState),
+    IdxInsert(OpIdxInsertState),
+    Insert(OpInsertState),
+    NoConflict(OpNoConflictState),
+    Column(OpColumnState),
+    RowId(OpRowIdState),
+    Transaction(OpTransactionState),
+    JournalMode(OpJournalModeState),
+    ParseSchema(OpParseSchemaState),
+    HashBuild(Option<OpHashBuildState>),
+    HashProbe(Option<OpHashProbeState>),
+    InitCdcVersion(OpInitCdcVersionState),
+}
+
+impl std::fmt::Debug for ActiveOpState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            ActiveOpState::None => "None",
+            ActiveOpState::Delete(_) => "Delete",
+            ActiveOpState::Destroy(_) => "Destroy",
+            ActiveOpState::IdxDelete(_) => "IdxDelete",
+            ActiveOpState::IntegrityCheck(_) => "IntegrityCheck",
+            ActiveOpState::OpenEphemeral(_) => "OpenEphemeral",
+            ActiveOpState::Program(_) => "Program",
+            ActiveOpState::NewRowid(_) => "NewRowid",
+            ActiveOpState::IdxInsert(_) => "IdxInsert",
+            ActiveOpState::Insert(_) => "Insert",
+            ActiveOpState::NoConflict(_) => "NoConflict",
+            ActiveOpState::Column(_) => "Column",
+            ActiveOpState::RowId(_) => "RowId",
+            ActiveOpState::Transaction(_) => "Transaction",
+            ActiveOpState::JournalMode(_) => "JournalMode",
+            ActiveOpState::ParseSchema(_) => "ParseSchema",
+            ActiveOpState::HashBuild(_) => "HashBuild",
+            ActiveOpState::HashProbe(_) => "HashProbe",
+            ActiveOpState::InitCdcVersion(_) => "InitCdcVersion",
+        };
+        f.write_str(name)
+    }
+}
+
+#[derive(Debug, Default)]
+struct ActiveOpStateSlot {
+    state: ActiveOpState,
+}
+
+macro_rules! active_state_accessor {
+    ($name:ident, $variant:ident, $ty:ty, $init:expr) => {
+        fn $name(&mut self) -> &mut $ty {
+            if matches!(self.state, ActiveOpState::None) {
+                self.state = ActiveOpState::$variant($init);
+            }
+            match &mut self.state {
+                ActiveOpState::$variant(state) => state,
+                state => unreachable!(
+                    "active opcode state mismatch: expected {}, got {:?}",
+                    stringify!($variant),
+                    state
+                ),
+            }
+        }
+    };
+}
+
+impl Default for ActiveOpState {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl ActiveOpStateSlot {
+    fn clear(&mut self) {
+        self.state = ActiveOpState::None;
+    }
+
+    active_state_accessor!(
+        delete,
+        Delete,
+        OpDeleteState,
+        OpDeleteState {
+            sub_state: OpDeleteSubState::MaybeCaptureRecord,
+            deleted_record: None,
+        }
+    );
+    active_state_accessor!(
+        destroy,
+        Destroy,
+        OpDestroyState,
+        OpDestroyState::CreateCursor
+    );
+    active_state_accessor!(idx_delete, IdxDelete, Option<OpIdxDeleteState>, None);
+    active_state_accessor!(
+        integrity_check,
+        IntegrityCheck,
+        OpIntegrityCheckState,
+        OpIntegrityCheckState::Start
+    );
+    active_state_accessor!(
+        open_ephemeral,
+        OpenEphemeral,
+        OpOpenEphemeralState,
+        OpOpenEphemeralState::Start
+    );
+    active_state_accessor!(program, Program, OpProgramState, OpProgramState::Start);
+    active_state_accessor!(new_rowid, NewRowid, OpNewRowidState, OpNewRowidState::Start);
+    active_state_accessor!(
+        idx_insert,
+        IdxInsert,
+        OpIdxInsertState,
+        OpIdxInsertState::MaybeSeek
+    );
+    active_state_accessor!(
+        insert,
+        Insert,
+        OpInsertState,
+        OpInsertState {
+            sub_state: OpInsertSubState::MaybeCaptureRecord,
+            old_record: None,
+            is_noop_update: false,
+        }
+    );
+    active_state_accessor!(
+        no_conflict,
+        NoConflict,
+        OpNoConflictState,
+        OpNoConflictState::Start
+    );
+    active_state_accessor!(column, Column, OpColumnState, OpColumnState::Start);
+    active_state_accessor!(row_id, RowId, OpRowIdState, OpRowIdState::Start);
+    active_state_accessor!(
+        transaction,
+        Transaction,
+        OpTransactionState,
+        OpTransactionState::Start
+    );
+    active_state_accessor!(
+        journal_mode,
+        JournalMode,
+        OpJournalModeState,
+        OpJournalModeState::default()
+    );
+    active_state_accessor!(parse_schema, ParseSchema, OpParseSchemaState, None);
+    active_state_accessor!(hash_build, HashBuild, Option<OpHashBuildState>, None);
+    active_state_accessor!(hash_probe, HashProbe, Option<OpHashProbeState>, None);
+    active_state_accessor!(
+        init_cdc_version,
+        InitCdcVersion,
+        OpInitCdcVersionState,
+        None
+    );
+
+    fn program_ref(&self) -> Option<&OpProgramState> {
+        match &self.state {
+            ActiveOpState::Program(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    fn program_mut(&mut self) -> Option<&mut OpProgramState> {
+        match &mut self.state {
+            ActiveOpState::Program(state) => Some(state),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct DeferredSeekState {
     pub index_cursor_id: CursorID,
     pub table_cursor_id: CursorID,
+}
+
+pub(crate) enum VacuumOpState {
+    None,
+    IntoFile(Box<VacuumIntoOpContext>),
+    InPlace(Box<VacuumInPlaceOpContext>),
+}
+
+impl Default for VacuumOpState {
+    fn default() -> Self {
+        Self::None
+    }
 }
 
 /// The program state describes the environment in which the program executes.
@@ -446,60 +597,27 @@ pub struct ProgramState {
     commit_state: CommitState,
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
-    op_delete_state: OpDeleteState,
-    op_destroy_state: OpDestroyState,
-    op_idx_delete_state: Option<OpIdxDeleteState>,
-    op_integrity_check_state: OpIntegrityCheckState,
+    active_op_state: ActiveOpStateSlot,
+    seek_state: OpSeekState,
     /// Metrics collected for the lifetime of this prepared statement.
     pub metrics: StatementMetrics,
-    op_open_ephemeral_state: OpOpenEphemeralState,
-    op_program_state: OpProgramState,
-    op_new_rowid_state: OpNewRowidState,
-    op_idx_insert_state: OpIdxInsertState,
-    op_insert_state: OpInsertState,
-    op_no_conflict_state: OpNoConflictState,
-    seek_state: OpSeekState,
     /// Current collation sequence set by OP_CollSeq instruction
     current_collation: Option<CollationSeq>,
-    op_column_state: OpColumnState,
-    op_row_id_state: OpRowIdState,
-    op_transaction_state: OpTransactionState,
-    op_journal_mode_state: OpJournalModeState,
-    op_vacuum_into_state: Option<OpVacuumIntoState>,
+    op_vacuum_state: VacuumOpState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
     /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
     pub(crate) auto_txn_cleanup: TxnCleanup,
-    /// Number of deferred foreign key violations when the statement started.
-    /// When a statement subtransaction rolls back, the connection's deferred foreign key violations counter
-    /// is reset to this value.
-    fk_deferred_violations_when_stmt_started: AtomicIsize,
-    /// Number of immediate foreign key violations that occurred during the active statement. If nonzero,
-    /// the statement subtransactionwill roll back.
-    fk_immediate_violations_during_stmt: AtomicIsize,
-    /// RowSet objects stored by register index
-    rowsets: HashMap<usize, RowSet>,
-    /// Bloom filters stored by cursor ID for probabilistic set membership testing
-    /// Used to avoid unnecessary seeks on ephemeral indexes and hash tables
-    pub(crate) bloom_filters: HashMap<usize, BloomFilter>,
-    op_hash_build_state: Option<OpHashBuildState>,
-    op_hash_probe_state: Option<OpHashProbeState>,
+    pub explain_state: RwLock<ExplainState>,
     /// Scratch buffer for [Insn::HashDistinct] to avoid per-row allocations.
     distinct_key_values: Vec<Value>,
     hash_tables: HashMap<usize, HashTable>,
     /// TempFile handles for ephemeral cursors, keyed by cursor_id.
     /// Dropping removes the temp file from disk.
     ephemeral_temp_files: HashMap<usize, TempFile>,
-    uses_subjournal: bool,
-    /// Whether this statement is an active write inside an explicit transaction.
-    pub(crate) is_active_write: bool,
-    /// Whether begin_statement was called (savepoint + FK bookkeeping active).
-    has_stmt_transaction: bool,
     /// Attached pagers that have open savepoints for statement rollback.
     attached_savepoint_pagers: Vec<Arc<Pager>>,
-    pub n_change: AtomicI64,
-    pub explain_state: RwLock<ExplainState>,
     /// Pending error to return after FAIL mode commit completes.
     /// When a constraint error occurs with FAIL resolve type in autocommit mode,
     /// we need to commit partial changes before returning the error.
@@ -511,10 +629,27 @@ pub struct ProgramState {
     /// capture_data_changes has type Option<CaptureDataChangesInfo> (off mode is None)
     /// so, for pending_cdc_info we wrap it in one more Option<...> layer to represent if mode changed during program execution
     pub(crate) pending_cdc_info: Option<Option<CaptureDataChangesInfo>>,
-    pub(crate) op_parse_schema_state: execute::OpParseSchemaState,
     /// Cached subprogram Statements keyed by the PC of the Program instruction.
     /// Avoids re-allocating ProgramState on each trigger/FK-action fire.
     pub(crate) subprogram_stmt_cache: HashMap<usize, Box<Statement>>,
+    /// RowSet objects stored by register index
+    rowsets: HashMap<usize, RowSet>,
+    /// Bloom filters stored by cursor ID for probabilistic set membership testing
+    /// Used to avoid unnecessary seeks on ephemeral indexes and hash tables
+    pub(crate) bloom_filters: HashMap<usize, BloomFilter>,
+    /// Number of deferred foreign key violations when the statement started.
+    /// When a statement subtransaction rolls back, the connection's deferred foreign key violations counter
+    /// is reset to this value.
+    fk_deferred_violations_when_stmt_started: AtomicIsize,
+    /// Number of immediate foreign key violations that occurred during the active statement. If nonzero,
+    /// the statement subtransactionwill roll back.
+    fk_immediate_violations_during_stmt: AtomicIsize,
+    uses_subjournal: bool,
+    /// Whether this statement is an active write inside an explicit transaction.
+    pub(crate) is_active_write: bool,
+    /// Whether begin_statement was called (savepoint + FK bookkeeping active).
+    has_stmt_transaction: bool,
+    pub n_change: AtomicI64,
 }
 
 impl std::fmt::Debug for Program {
@@ -554,34 +689,12 @@ impl ProgramState {
             commit_state: CommitState::Ready,
             #[cfg(feature = "json")]
             json_cache: JsonCacheCell::new(),
-            op_delete_state: OpDeleteState {
-                sub_state: OpDeleteSubState::MaybeCaptureRecord,
-                deleted_record: None,
-            },
-            op_destroy_state: OpDestroyState::CreateCursor,
-            op_idx_delete_state: None,
-            op_integrity_check_state: OpIntegrityCheckState::Start,
-            metrics: StatementMetrics::new(),
-            op_open_ephemeral_state: OpOpenEphemeralState::Start,
-            op_program_state: OpProgramState::Start,
-            op_new_rowid_state: OpNewRowidState::Start,
-            op_idx_insert_state: OpIdxInsertState::MaybeSeek,
-            op_insert_state: OpInsertState {
-                sub_state: OpInsertSubState::MaybeCaptureRecord,
-                old_record: None,
-                is_noop_update: false,
-            },
-            op_no_conflict_state: OpNoConflictState::Start,
-            op_hash_build_state: None,
-            op_hash_probe_state: None,
-            distinct_key_values: Vec::new(),
+            active_op_state: ActiveOpStateSlot::default(),
             seek_state: OpSeekState::Start,
+            metrics: StatementMetrics::new(),
+            distinct_key_values: Vec::new(),
             current_collation: None,
-            op_column_state: OpColumnState::Start,
-            op_row_id_state: OpRowIdState::Start,
-            op_transaction_state: OpTransactionState::Start,
-            op_journal_mode_state: OpJournalModeState::default(),
-            op_vacuum_into_state: None,
+            op_vacuum_state: VacuumOpState::None,
             view_delta_state: ViewDeltaCommitState::NotStarted,
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
@@ -598,7 +711,6 @@ impl ProgramState {
             explain_state: RwLock::new(ExplainState::default()),
             pending_fail_error: None,
             pending_cdc_info: None,
-            op_parse_schema_state: None,
             subprogram_stmt_cache: HashMap::default(),
         }
     }
@@ -694,31 +806,11 @@ impl ProgramState {
         self.json_cache.clear();
 
         // Reset state machines
-        self.op_delete_state = OpDeleteState {
-            sub_state: OpDeleteSubState::MaybeCaptureRecord,
-            deleted_record: None,
-        };
-        self.op_idx_delete_state = None;
-        self.op_integrity_check_state = OpIntegrityCheckState::Start;
-        self.op_open_ephemeral_state = OpOpenEphemeralState::Start;
-        self.op_new_rowid_state = OpNewRowidState::Start;
-        self.op_idx_insert_state = OpIdxInsertState::MaybeSeek;
-        self.op_insert_state = OpInsertState {
-            sub_state: OpInsertSubState::MaybeCaptureRecord,
-            old_record: None,
-            is_noop_update: false,
-        };
-        self.op_no_conflict_state = OpNoConflictState::Start;
+        self.active_op_state.clear();
         self.seek_state = OpSeekState::Start;
         self.current_collation = None;
-        self.op_column_state = OpColumnState::Start;
-        self.op_row_id_state = OpRowIdState::Start;
         self.commit_state = CommitState::Ready;
-        self.op_destroy_state = OpDestroyState::CreateCursor;
-        self.op_program_state = OpProgramState::Start;
-        self.op_transaction_state = OpTransactionState::Start;
-        self.op_journal_mode_state = OpJournalModeState::default();
-        self.op_vacuum_into_state = None;
+        self.op_vacuum_state = VacuumOpState::None;
         self.view_delta_state = ViewDeltaCommitState::NotStarted;
         self.auto_txn_cleanup = TxnCleanup::None;
         self.fk_immediate_violations_during_stmt
@@ -729,8 +821,6 @@ impl ProgramState {
         self.bloom_filters.clear();
         self.hash_tables.clear();
         self.ephemeral_temp_files.clear();
-        self.op_hash_build_state = None;
-        self.op_hash_probe_state = None;
         self.uses_subjournal = false;
         self.is_active_write = false;
         self.has_stmt_transaction = false;
@@ -755,7 +845,7 @@ impl ProgramState {
 
     pub(crate) fn metrics(&self) -> StatementMetrics {
         let mut metrics = self.metrics.clone();
-        if let OpProgramState::Step { statement, .. } = &self.op_program_state {
+        if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_ref() {
             metrics.merge(&statement.metrics());
         }
         for statement in self.subprogram_stmt_cache.values() {
@@ -766,7 +856,7 @@ impl ProgramState {
 
     pub(crate) fn reset_metrics(&mut self) {
         self.metrics.reset();
-        if let OpProgramState::Step { statement, .. } = &mut self.op_program_state {
+        if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
             statement.reset_metrics();
         }
         for statement in self.subprogram_stmt_cache.values_mut() {
@@ -785,7 +875,7 @@ impl ProgramState {
             crate::statement::StatementStatusCounter::RowsRead => self.metrics.rows_read = 0,
             crate::statement::StatementStatusCounter::RowsWritten => self.metrics.rows_written = 0,
         }
-        if let OpProgramState::Step { statement, .. } = &mut self.op_program_state {
+        if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
             statement.reset_stmt_status(counter);
         }
         for statement in self.subprogram_stmt_cache.values_mut() {
@@ -889,8 +979,10 @@ impl ProgramState {
                         }
                     });
                     Ok(())
-                } else if self.uses_subjournal {
-                    pager.release_savepoint()?;
+                } else if self.uses_subjournal || !attached_pagers.is_empty() {
+                    if self.uses_subjournal {
+                        pager.release_savepoint()?;
+                    }
                     for p in &attached_pagers {
                         p.release_savepoint()?;
                     }
@@ -932,6 +1024,14 @@ impl ProgramState {
                         }
                         Err(e) => Some(e),
                     }
+                } else if !attached_pagers.is_empty() {
+                    let mut err = None;
+                    for p in &attached_pagers {
+                        if let Err(e) = p.rollback_to_newest_savepoint() {
+                            err = Some(e);
+                        }
+                    }
+                    err
                 } else {
                     None
                 };
@@ -1101,9 +1201,9 @@ pub struct PreparedProgram {
     pub resolve_type: ResolveType,
     pub prepare_context: PrepareContext,
     /// Set of attached database indices that need write transactions.
-    pub write_databases: HashSet<usize>,
+    pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.
-    pub read_databases: HashSet<usize>,
+    pub read_databases: BitSet,
 }
 
 #[derive(Clone)]
@@ -1163,7 +1263,7 @@ impl PreparedProgram {
     }
 
     #[inline]
-    pub fn is_readonly(&self) -> bool {
+    pub const fn is_readonly(&self) -> bool {
         self.readonly
     }
 }
@@ -1188,7 +1288,7 @@ impl Program {
 }
 
 impl Program {
-    fn get_pager_from_database_index(&self, idx: &usize) -> Arc<Pager> {
+    fn get_pager_from_database_index(&self, idx: &usize) -> Result<Arc<Pager>> {
         self.connection.get_pager_from_database_index(idx)
     }
 
@@ -1621,11 +1721,19 @@ impl Program {
         if tx_state == TransactionState::None
             && matches!(program_state.commit_state, CommitState::Ready)
         {
-            // No active transaction and no in-progress commit — nothing to do.
-            // Attached MVCC transactions are only started after the main DB's
-            // Transaction opcode runs, so tx_state==None implies no attached
-            // MVCC txs either.
-            return Ok(IOResult::Done(()));
+            // No main transaction and no in-progress commit — check whether
+            // any attached/temp database still has an active transaction before
+            // bailing out. Defer these checks to here so the common case
+            // (active main transaction) doesn't pay for the lock reads.
+            let has_attached_mv_tx = self.connection.next_attached_mv_tx().is_some();
+            let has_attached_wal_tx =
+                self.connection
+                    .with_all_attached_pagers_with_index(|pagers| {
+                        pagers.iter().any(|(_, pager)| pager.holds_read_lock())
+                    });
+            if !has_attached_mv_tx && !has_attached_wal_tx {
+                return Ok(IOResult::Done(()));
+            }
         }
         if self.connection.is_nested_stmt() {
             // We don't want to commit on nested statements. Let parent handle it.
@@ -1636,9 +1744,25 @@ impl Program {
         } else {
             self.commit_txn_wal(pager, program_state, rollback)
         }?;
-        if !res.is_io() && self.change_cnt_on {
-            self.connection
-                .set_changes(program_state.n_change.load(Ordering::SeqCst));
+        if !res.is_io() {
+            if self.change_cnt_on {
+                self.connection
+                    .set_changes(program_state.n_change.load(Ordering::SeqCst));
+            }
+            let transaction_finished = self.connection.auto_commit.load(Ordering::SeqCst)
+                && self.connection.get_tx_state() == TransactionState::None;
+            if transaction_finished {
+                // Finalize the in-memory TEMP schema only when the outer
+                // transaction actually finishes. Updating the committed temp
+                // snapshot after every statement inside an explicit
+                // transaction would make a later full ROLLBACK restore
+                // uncommitted temp DDL.
+                if rollback {
+                    self.connection.rollback_temp_schema();
+                } else {
+                    self.connection.commit_temp_schema();
+                }
+            }
         }
         Ok(res)
     }
@@ -1698,7 +1822,17 @@ impl Program {
                     self.end_attached_read_txns(&connection);
                     Ok(IOResult::Done(()))
                 }
-                TransactionState::None => Ok(IOResult::Done(())),
+                TransactionState::None => {
+                    match self.end_attached_write_txns(&connection, rollback)? {
+                        IOResult::Done(_) => {}
+                        IOResult::IO(io) => {
+                            program_state.commit_state = CommitState::CommittingAttached;
+                            return Ok(IOResult::IO(io));
+                        }
+                    }
+                    self.end_attached_read_txns(&connection);
+                    Ok(IOResult::Done(()))
+                }
                 TransactionState::PendingUpgrade { .. } => {
                     panic!("Unexpected transaction state: {tx_state:?} during auto-commit",)
                 }
@@ -1784,8 +1918,10 @@ impl Program {
             };
             match step_result {
                 IOResult::Done(_) => {
-                    let attached_pager = conn.get_pager_from_database_index(&db_id);
-                    conn.publish_attached_schema(db_id);
+                    let attached_pager = conn
+                        .get_pager_from_database_index(&db_id)
+                        .expect("attached MVCC transaction should always have a pager");
+                    conn.publish_database_schema(db_id);
                     conn.set_mv_tx_for_db(db_id, None);
                     attached_pager.end_read_tx();
                     // Fall through to look for more
@@ -1819,8 +1955,10 @@ impl Program {
             };
             match state_machine.step(&attached_mv_store)? {
                 IOResult::Done(_) => {
-                    let attached_pager = conn.get_pager_from_database_index(&db_id);
-                    conn.publish_attached_schema(db_id);
+                    let attached_pager = conn
+                        .get_pager_from_database_index(&db_id)
+                        .expect("attached MVCC transaction should always have a pager");
+                    conn.publish_database_schema(db_id);
                     conn.set_mv_tx_for_db(db_id, None);
                     attached_pager.end_read_tx();
                     continue;
@@ -1930,57 +2068,69 @@ impl Program {
         connection: &Connection,
         rollback: bool,
     ) -> Result<IOResult<()>> {
-        let pagers = connection.get_all_attached_pagers_with_index();
-        for (db_id, attached_pager) in pagers {
-            // MVCC-enabled attached DBs are committed in commit_txn_mvcc phase 2
-            if connection.mv_store_for_db(db_id).is_some() {
-                continue;
-            }
-            if !attached_pager.holds_write_lock() {
-                continue;
-            }
-            if !rollback {
-                // Commit dirty pages to WAL, then end write+read transactions.
-                // We disable auto-checkpoint and avoid pager.commit_tx() since
-                // the checkpoint logic can leave read locks held.
-                match attached_pager.commit_dirty_pages(true, SyncMode::Normal, false) {
-                    Ok(IOResult::Done(_)) => {}
-                    Ok(IOResult::IO(io)) => {
-                        // IO pending — return so the caller can yield and re-enter.
-                        // commit_dirty_pages tracks its own internal state, so calling
-                        // it again on re-entry will resume correctly.
-                        return Ok(IOResult::IO(io));
-                    }
-                    Err(e) => return Err(e),
+        connection.with_all_attached_pagers_with_index(|pagers| {
+            for (db_id, attached_pager) in pagers {
+                let db_id = *db_id;
+                // MVCC-enabled attached DBs are committed in commit_txn_mvcc phase 2
+                if connection.mv_store_for_db(db_id).is_some() {
+                    continue;
                 }
-                // WAL commit succeeded — publish the connection-local schema
-                // changes to the shared Database so other connections can see them.
-                connection.publish_attached_schema(db_id);
-                attached_pager.end_write_tx();
-                attached_pager.end_read_tx();
-                attached_pager.commit_dirty_pages_end();
-            } else {
-                // Discard any local schema changes on rollback
-                connection.database_schemas().write().remove(&db_id);
-                attached_pager.rollback_attached();
+                if !attached_pager.holds_write_lock() {
+                    continue;
+                }
+                if !rollback {
+                    // Commit dirty pages to WAL, then end write+read transactions.
+                    // We disable auto-checkpoint and avoid pager.commit_tx() since
+                    // the checkpoint logic can leave read locks held.
+                    match attached_pager.commit_dirty_pages(true, SyncMode::Normal, false) {
+                        Ok(IOResult::Done(_)) => {}
+                        Ok(IOResult::IO(io)) => {
+                            // IO pending — return so the caller can yield and re-enter.
+                            // commit_dirty_pages tracks its own internal state, so calling
+                            // it again on re-entry will resume correctly.
+                            return Ok(IOResult::IO(io));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    // WAL commit succeeded — publish the connection-local schema
+                    // changes to the shared Database so other connections can see them.
+                    connection.publish_database_schema(db_id);
+                    attached_pager.end_write_tx();
+                    attached_pager.end_read_tx();
+                    attached_pager.commit_dirty_pages_end();
+                } else {
+                    // Discard any local schema changes on rollback
+                    connection.database_schemas().write().remove(&db_id);
+                    attached_pager.rollback_attached();
+                }
             }
-        }
-        Ok(IOResult::Done(()))
+            Ok(IOResult::Done(()))
+        })
     }
 
     /// End read transactions on all attached databases that had transactions started.
     fn end_attached_read_txns(&self, connection: &Connection) {
-        for attached_pager in connection.get_all_attached_pagers() {
-            if attached_pager.holds_read_lock() {
-                attached_pager.end_read_tx();
-            }
-        }
+        connection.with_all_attached_pagers_with_index(|pagers| {
+            pagers.iter().for_each(|(db_id, attached_pager)| {
+                if connection.mv_store_for_db(*db_id).is_some() {
+                    // MVCC-enabled attached DBs don't use WAL read transactions, so skip.
+                    return;
+                }
+                if attached_pager.holds_write_lock() {
+                    // Attached pager has a write lock, so its read transaction was ended by end_attached_write_txns: skip.
+                    return;
+                }
+                if attached_pager.holds_read_lock() {
+                    attached_pager.end_read_tx();
+                }
+            });
+        })
     }
 
     #[instrument(skip(self, commit_state, mv_store), level = Level::DEBUG)]
     fn step_end_mvcc_txn(
         &self,
-        commit_state: &mut StateMachine<CommitStateMachine<MvccClock>>,
+        commit_state: &mut StateMachine<Box<CommitStateMachine<MvccClock>>>,
         mv_store: &Arc<MvStore>,
     ) -> Result<IOResult<()>> {
         commit_state.step(mv_store)
@@ -2007,6 +2157,17 @@ impl Program {
         }
 
         let mut abort_error: Option<LimboError> = None;
+
+        // VACUUM (and VACUUM INTO) state can own internal helper statements whose drop path
+        // releases nested guards. Clean it before checking whether this program
+        // is itself nested; otherwise abort could skip top-level cleanup.
+        if let Err(err) = execute::cleanup_vacuum_state(&self.connection, state) {
+            capture_abort_error(
+                &mut abort_error,
+                err,
+                "Failed to clean up VACUUM state during abort",
+            );
+        }
 
         // Only end trigger execution if the subprogram was actually running.
         // Cached (pooled) statements may be dropped after their trigger execution
@@ -2060,6 +2221,7 @@ impl Program {
                     if self.connection.get_auto_commit() {
                         self.rollback_current_txn(pager);
                     }
+                    self.connection.set_changes_without_total(0);
                 }
                 // Constraint and RAISE errors: behavior depends on the effective resolve type.
                 // For normal constraints, the resolve type comes from the statement (ON CONFLICT).
@@ -2146,6 +2308,11 @@ impl Program {
                             }
                         }
                     }
+                    let last_change = match effective_resolve {
+                        ResolveType::Fail => state.n_change.load(Ordering::SeqCst),
+                        _ => 0,
+                    };
+                    self.connection.set_changes_without_total(last_change);
                 }
                 Some(LimboError::RaiseIgnore) => {
                     tracing::error!(
@@ -2175,19 +2342,7 @@ impl Program {
     }
 
     fn rollback_current_txn(&self, pager: &Arc<Pager>) {
-        if let Some(mv_store) = self.connection.mv_store().as_ref() {
-            if let Some(tx_id) = self.connection.get_mv_tx_id() {
-                self.connection.auto_commit.store(true, Ordering::SeqCst);
-                mv_store.rollback_tx(tx_id, pager.clone(), &self.connection, crate::MAIN_DB_ID);
-            }
-            pager.end_read_tx();
-            self.connection.rollback_attached_mvcc_txs(true);
-        } else {
-            pager.rollback_tx(&self.connection);
-            self.connection.auto_commit.store(true, Ordering::SeqCst);
-        }
-        self.connection.rollback_attached_wal_txns();
-        self.connection.set_tx_state(TransactionState::None);
+        self.connection.rollback_current_txn_state(pager, true);
     }
 
     pub fn is_trigger_subprogram(&self) -> bool {
@@ -2210,6 +2365,22 @@ pub(crate) fn make_record(
 ) -> ImmutableRecord {
     let regs = &registers[*start_reg..*start_reg + *count];
     ImmutableRecord::from_registers(regs, regs.len())
+}
+
+/// Split a register slice into an immutable ref and a mutable ref at two distinct indices.
+pub(crate) fn split_registers(
+    registers: &mut [Register],
+    src: usize,
+    dst: usize,
+) -> (&Register, &mut Register) {
+    debug_assert_ne!(src, dst, "split_registers: src and dst must differ");
+    if src < dst {
+        let (left, right) = registers.split_at_mut(dst);
+        (&left[src], &mut right[0])
+    } else {
+        let (left, right) = registers.split_at_mut(src);
+        (&right[0], &mut left[dst])
+    }
 }
 
 pub fn registers_to_ref_values<'a>(
@@ -2547,6 +2718,54 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    #[test]
+    fn active_opcode_helpers_initialize_defaults() {
+        let mut state = ProgramState::new(1, 0);
+
+        assert!(matches!(state.active_op_state.state, ActiveOpState::None));
+        assert!(matches!(
+            state.active_op_state.column(),
+            OpColumnState::Start
+        ));
+        state.active_op_state.clear();
+        assert!(state.active_op_state.parse_schema().is_none());
+    }
+
+    #[test]
+    fn active_opcode_helpers_reject_mismatched_resumes() {
+        let mut state = ProgramState::new(1, 0);
+        *state.active_op_state.column() = OpColumnState::GetColumn;
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = state.active_op_state.parse_schema();
+        }));
+        assert!(panic.is_err(), "mismatched opcode resume should panic");
+    }
+
+    #[test]
+    fn seek_state_is_independent_from_active_opcode_slot() {
+        let mut state = ProgramState::new(1, 0);
+
+        *state.active_op_state.insert() = OpInsertState {
+            sub_state: OpInsertSubState::Seek,
+            old_record: None,
+            is_noop_update: false,
+        };
+        state.seek_state = OpSeekState::MoveLast;
+
+        assert!(matches!(
+            state.active_op_state.insert().sub_state,
+            OpInsertSubState::Seek
+        ));
+        assert!(matches!(state.seek_state, OpSeekState::MoveLast));
+    }
+}
+
 /// Shuttle tests for validating the `unsafe impl Send + Sync for ProgramState` safety claims.
 ///
 /// The safety claims are:
@@ -2556,6 +2775,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
 ///
 /// These tests verify that the implementation correctly upholds these invariants
 /// under concurrent access patterns.
+
 #[cfg(all(shuttle, test))]
 mod shuttle_tests {
     use super::*;

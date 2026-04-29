@@ -89,10 +89,17 @@ pub struct Opts {
     pub experimental_index_method: bool,
     #[clap(long, help = "Enable experimental autovacuum feature")]
     pub experimental_autovacuum: bool,
+    #[clap(long, help = "Enable experimental vacuum feature")]
+    pub experimental_vacuum: bool,
     #[clap(long, help = "Enable experimental attach feature")]
     pub experimental_attach: bool,
     #[clap(long, help = "Enable experimental generated columns feature")]
     pub experimental_generated_columns: bool,
+    #[clap(
+        long,
+        help = "Enable experimental multiprocess WAL coordination (on Windows, use --vfs experimental_win_iocp)"
+    )]
+    pub experimental_multiprocess_wal: bool,
     #[cfg(feature = "mvcc_repl")]
     #[clap(long, help = "Start MVCC concurrent transaction harness")]
     pub mvcc: bool,
@@ -231,8 +238,10 @@ impl Limbo {
             .with_encryption(opts.experimental_encryption)
             .with_index_method(opts.experimental_index_method)
             .with_autovacuum(opts.experimental_autovacuum)
+            .with_vacuum(opts.experimental_vacuum)
             .with_attach(opts.experimental_attach)
             .with_generated_columns(opts.experimental_generated_columns)
+            .with_multiprocess_wal(opts.experimental_multiprocess_wal)
             .with_unsafe_testing(opts.unsafe_testing);
 
         let db_file = normalize_db_path(db_file);
@@ -962,14 +971,14 @@ impl Limbo {
                 let output_mode = self.opts.output_mode;
 
                 match (output_mode, query_mode) {
+                    (OutputMode::List, _) => {
+                        self.print_list_mode(rows, statistics)?;
+                    }
                     (_, QueryMode::ExplainQueryPlan) => {
                         self.print_explain_query_plan(rows, statistics)?;
                     }
                     (_, QueryMode::Explain) => {
                         self.print_explain(rows, statistics)?;
-                    }
-                    (OutputMode::List, _) => {
-                        self.print_list_mode(rows, statistics)?;
                     }
                     (OutputMode::Pretty, _) => {
                         self.print_pretty_mode(rows, statistics)?;

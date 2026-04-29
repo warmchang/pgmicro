@@ -103,6 +103,36 @@ fn test_sequential_overflow_page(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[turso_macros::test]
+fn test_insert_without_rowid_table(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute(
+        "CREATE TABLE config (value TEXT NOT NULL, key TEXT PRIMARY KEY, scope TEXT) WITHOUT ROWID",
+    )?;
+    conn.execute("INSERT INTO config (scope, key, value) VALUES ('user', 'theme', 'dark')")?;
+    conn.execute("INSERT INTO config (key, value, scope) VALUES ('language', 'en', 'global')")?;
+
+    let rows: Vec<(String, String, String)> =
+        conn.exec_rows("SELECT key, value, scope FROM config ORDER BY key");
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "language".to_string(),
+                "en".to_string(),
+                "global".to_string()
+            ),
+            ("theme".to_string(), "dark".to_string(), "user".to_string()),
+        ]
+    );
+
+    do_flush(&conn, &tmp_db)?;
+    rusqlite_integrity_check(tmp_db.path.as_path())?;
+    Ok(())
+}
+
 #[turso_macros::test(init_sql = "CREATE TABLE test (x INTEGER PRIMARY KEY);")]
 #[ignore = "this takes too long :)"]
 fn test_sequential_write(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -891,6 +921,28 @@ pub fn upsert_conflict(limbo: TempDatabase) {
     }
     let rows: Vec<(i64, i64, i64)> = conn.exec_rows("SELECT * FROM t");
     assert_eq!(rows, vec![(1, 2, 42)]);
+}
+
+#[turso_macros::test]
+pub fn insert_returning_qualified_quoted_table(limbo: TempDatabase) {
+    // Regression: qualified column refs in RETURNING (e.g. "users"."id")
+    // failed with `no such table: users` when the table was created with
+    // quoted identifiers, because INSERT stored the joined-table identifier
+    // via `Name::to_string` (which preserves quotes) instead of normalizing
+    // it like DELETE/UPDATE do.
+    let conn = limbo.db.connect().unwrap();
+    conn.execute(r#"CREATE TABLE "users" ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "name" TEXT);"#)
+        .unwrap();
+    assert_eq!(
+        vec![vec![
+            rusqlite::types::Value::Integer(1),
+            rusqlite::types::Value::Text("ret".to_string()),
+        ]],
+        limbo_exec_rows(
+            &conn,
+            r#"INSERT INTO "users" ("name") VALUES ('ret') RETURNING "users"."id", "users"."name""#,
+        )
+    );
 }
 
 #[turso_macros::test]

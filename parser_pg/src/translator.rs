@@ -3742,7 +3742,7 @@ fn translate_create_enum(
     Ok(ast::Stmt::CreateType {
         if_not_exists: false,
         type_name,
-        body: ast::CreateTypeBody {
+        body: ast::CreateTypeBody::CustomType {
             params: vec![ast::TypeParam {
                 name: "value".into(),
                 ty: Some("text".into()),

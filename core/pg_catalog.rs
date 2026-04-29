@@ -206,7 +206,7 @@ impl PgClassCursor {
                 _ => continue,
             };
             let table_oid = USER_TABLE_OID_START + i as i64;
-            let relnatts = btree.columns.len() as i64;
+            let relnatts = btree.columns().len() as i64;
             let relhasindex = if schema.get_indices(table_name).next().is_some() {
                 1i64
             } else {
@@ -2582,7 +2582,7 @@ impl PgAttrdefCursor {
             };
             let table_oid = tbl_oid_map.get(*table_name).copied().unwrap_or(0);
 
-            for (col_idx, col) in btree.columns.iter().enumerate() {
+            for (col_idx, col) in btree.columns().iter().enumerate() {
                 if let Some(default_expr) = &col.default {
                     self.rows.push(vec![
                         Value::from_i64(attrdef_oid),                // oid

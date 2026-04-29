@@ -1,7 +1,7 @@
 use super::emitter::{emit_program, TranslateCtx};
 use super::plan::{
     select_star, Distinctness, InSeekSource, JoinOrderMember, Operation, OuterQueryReference,
-    QueryDestination, Search, TableReferences, WhereTerm, Window,
+    QueryDestination, Search, TableReferences, Window,
 };
 use crate::schema::Table;
 use crate::sync::Arc;
@@ -13,8 +13,8 @@ use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState};
 use crate::translate::planner::{
-    break_predicate_at_and_boundaries, parse_from, parse_limit, parse_where,
-    plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
+    append_vtab_predicates_to_where_clause, break_predicate_at_and_boundaries, parse_from,
+    parse_limit, parse_where, plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
 };
 use crate::translate::result_row::emit_select_result;
 use crate::translate::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_values};
@@ -38,7 +38,7 @@ pub fn translate_select(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
-    let mut select_plan = prepare_select_plan(
+    let plan = prepare_select_plan(
         select,
         resolver,
         program,
@@ -47,13 +47,23 @@ pub fn translate_select(
         connection,
     )?;
     if program.trigger.is_some() {
-        if let Some(virtual_table) = plan_first_virtual_table_name(&select_plan) {
+        if let Some(virtual_table) = plan_first_virtual_table_name(&plan) {
             crate::bail_parse_error!("unsafe use of virtual table \"{}\"", virtual_table);
         }
     }
-    optimize_plan(program, &mut select_plan, resolver)?;
+    emit_select_plan(plan, resolver, program, connection)
+}
+
+/// Optimize and emit bytecode for an already-prepared select plan.
+pub fn emit_select_plan(
+    mut plan: Plan,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> Result<usize> {
+    optimize_plan(program, &mut plan, resolver)?;
     let num_result_cols;
-    let opts = match &select_plan {
+    let opts = match &plan {
         Plan::Select(select) => {
             num_result_cols = select.result_columns.len();
             ProgramBuilderOpts {
@@ -86,11 +96,11 @@ pub fn translate_select(
                         .sum::<usize>(),
             }
         }
-        other => panic!("plan is not a SelectPlan: {other:?}"),
+        _ => crate::bail_parse_error!("emit_select_plan called with non-SELECT plan"),
     };
 
     program.extend(&opts);
-    emit_program(connection, resolver, program, select_plan, |_| {})?;
+    emit_program(connection, resolver, program, plan, |_| {})?;
     Ok(num_result_cols)
 }
 
@@ -143,7 +153,7 @@ pub fn prepare_select_plan(
 ) -> Result<Plan> {
     let compounds = select.body.compounds;
     match compounds.is_empty() {
-        true => Ok(Plan::Select(prepare_one_select_plan(
+        true => Ok(Plan::Select(Box::new(prepare_one_select_plan(
             select.body.select,
             resolver,
             program,
@@ -153,7 +163,7 @@ pub fn prepare_select_plan(
             outer_query_refs,
             query_destination,
             connection,
-        )?)),
+        )?))),
         false => {
             // For compound SELECTs, the WITH clause applies to all parts.
             // We clone the WITH clause for each SELECT in the compound so that
@@ -227,7 +237,7 @@ pub fn prepare_select_plan(
 
             Ok(Plan::CompoundSelect {
                 left,
-                right_most: last,
+                right_most: Box::new(last),
                 limit,
                 offset,
                 order_by,
@@ -348,6 +358,7 @@ fn prepare_one_select_plan(
                 input_cardinality_hint: None,
                 estimated_output_rows: None,
                 simple_aggregate: None,
+                phantom_params: vec![],
             };
 
             let mut windows = Vec::with_capacity(window_clause.len());
@@ -551,8 +562,8 @@ fn prepare_one_select_plan(
                     plan.group_by = Some(GroupBy {
                         sort_order: Vec::new(),
                         nulls_order: Vec::new(),
+                        exprs: group_by.exprs.into_iter().map(|expr| *expr).collect(),
                         sort_elided: false,
-                        exprs: group_by.exprs.iter().map(|expr| *expr.clone()).collect(),
                         having: having_predicates,
                     });
                 } else {
@@ -770,14 +781,15 @@ fn prepare_one_select_plan(
                 query_destination,
                 distinctness: Distinctness::NonDistinct,
                 values: values
-                    .iter()
-                    .map(|values| values.iter().map(|value| *value.clone()).collect())
+                    .into_iter()
+                    .map(|values| values.into_iter().map(|value| *value).collect())
                     .collect(),
                 window: None,
                 non_from_clause_subqueries,
                 input_cardinality_hint: None,
                 estimated_output_rows: None,
                 simple_aggregate: None,
+                phantom_params: vec![],
             };
 
             validate_expr_correct_column_counts(&plan)?;
@@ -1015,48 +1027,13 @@ fn add_vtab_predicates_to_where_clause(
     plan: &mut SelectPlan,
     resolver: &Resolver,
 ) -> Result<()> {
-    for expr in vtab_predicates.iter_mut() {
-        bind_and_rewrite_expr(
-            expr,
-            Some(&mut plan.table_references),
-            Some(&plan.result_columns),
-            resolver,
-            BindingBehavior::TryCanonicalColumnsFirst,
-        )?;
-    }
-    for expr in vtab_predicates.drain(..) {
-        // Virtual table argument predicates (e.g. the 't2' in pragma_table_info('t2'))
-        // must be associated with the virtual table's outer join context if the table is
-        // the RHS of a LEFT JOIN. Otherwise the optimizer may incorrectly simplify the
-        // LEFT JOIN into an INNER JOIN, breaking NULL row emission for unmatched rows.
-        let from_outer_join = vtab_predicate_table_id(&expr).and_then(|table_id| {
-            plan.table_references
-                .find_joined_table_by_internal_id(table_id)
-                .and_then(|t| {
-                    t.join_info
-                        .as_ref()
-                        .and_then(|ji| ji.is_outer().then_some(table_id))
-                })
-        });
-        plan.where_clause.push(WhereTerm {
-            expr,
-            from_outer_join,
-            consumed: false,
-        });
-    }
-    Ok(())
-}
-
-/// Extract the table internal_id from a virtual table argument predicate.
-/// These are always of the form `Column { table, .. } = literal` or `IsNull(Column { table, .. })`.
-fn vtab_predicate_table_id(expr: &Expr) -> Option<ast::TableInternalId> {
-    match expr {
-        Expr::Binary(lhs, _, _) | Expr::IsNull(lhs) => match lhs.as_ref() {
-            Expr::Column { table, .. } => Some(*table),
-            _ => None,
-        },
-        _ => None,
-    }
+    append_vtab_predicates_to_where_clause(
+        vtab_predicates,
+        &mut plan.table_references,
+        &plan.result_columns,
+        &mut plan.where_clause,
+        resolver,
+    )
 }
 
 /// Replaces a column number in an ORDER BY or GROUP BY expression with a copy of the column expression.
@@ -1422,6 +1399,7 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
             | Expr::Literal(_)
             | Expr::Name(_)
             | Expr::Qualified(_, _)
+            | Expr::FieldAccess { .. }
             | Expr::Register(_)
             | Expr::RowId { .. }
             | Expr::Variable(_)
