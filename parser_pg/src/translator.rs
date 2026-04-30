@@ -111,6 +111,7 @@ impl PostgreSQLTranslator {
             NodeRef::ViewStmt(view) => self.translate_create_view(view),
             NodeRef::CreateTableAsStmt(ctas) => self.translate_create_table_as(ctas),
             NodeRef::CreateEnumStmt(enum_stmt) => translate_create_enum(enum_stmt),
+            NodeRef::CreateDomainStmt(domain) => self.translate_create_domain(domain),
             NodeRef::CopyStmt(copy) => self.translate_copy(copy),
             _ => Err(ParseError::ParseError(format!(
                 "{} is not supported",
@@ -839,6 +840,10 @@ impl PostgreSQLTranslator {
             ObjectType::ObjectType => Ok(ast::Stmt::DropType {
                 if_exists: drop.missing_ok,
                 type_name: qualified_name.name.as_str().to_string(),
+            }),
+            ObjectType::ObjectDomain => Ok(ast::Stmt::DropDomain {
+                if_exists: drop.missing_ok,
+                domain_name: qualified_name.name.as_str().to_string(),
             }),
             _ => Err(ParseError::ParseError(format!(
                 "DROP {} is not supported",
@@ -3516,6 +3521,86 @@ impl PostgreSQLTranslator {
             escape,
         })
     }
+
+    fn translate_create_domain(
+        &self,
+        domain: &pg_query::protobuf::CreateDomainStmt,
+    ) -> Result<ast::Stmt, ParseError> {
+        use pg_query::protobuf::node::Node;
+        use pg_query::protobuf::ConstrType;
+
+        // Extract domain name (skip schema qualifiers like "pg_catalog")
+        let mut domain_name = String::new();
+        for name_node in &domain.domainname {
+            if let Some(Node::String(s)) = &name_node.node {
+                if s.sval != "pg_catalog" {
+                    domain_name = s.sval.clone();
+                }
+            }
+        }
+        if domain_name.is_empty() {
+            return Err(ParseError::ParseError(
+                "CREATE DOMAIN missing domain name".into(),
+            ));
+        }
+
+        // Extract base type from type_name and map PG type names to Turso names
+        let type_name_node = domain.type_name.as_ref().ok_or_else(|| {
+            ParseError::ParseError("CREATE DOMAIN missing base type".into())
+        })?;
+        let pg_type = extract_type_name_from_typename(type_name_node)?;
+        let base_type = match map_pg_type(&pg_type, &[]) {
+            Some(mapping) => mapping.type_name,
+            None => pg_type, // custom type or domain — pass through
+        };
+
+        // Process constraints
+        let mut default = None;
+        let mut not_null = false;
+        let mut constraints = Vec::new();
+
+        for constraint_node in &domain.constraints {
+            let Some(Node::Constraint(constraint)) = &constraint_node.node else {
+                continue;
+            };
+            let contype =
+                ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
+            match contype {
+                ConstrType::ConstrDefault => {
+                    if let Some(ref raw_expr) = constraint.raw_expr {
+                        default = Some(Box::new(self.translate_expr(raw_expr)?));
+                    }
+                }
+                ConstrType::ConstrNotnull => {
+                    not_null = true;
+                }
+                ConstrType::ConstrCheck => {
+                    if let Some(ref raw_expr) = constraint.raw_expr {
+                        let check_expr = self.translate_expr(raw_expr)?;
+                        let name = if constraint.conname.is_empty() {
+                            None
+                        } else {
+                            Some(constraint.conname.clone())
+                        };
+                        constraints.push(ast::DomainConstraint {
+                            name,
+                            check: Box::new(check_expr),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(ast::Stmt::CreateDomain {
+            if_not_exists: false,
+            domain_name,
+            base_type,
+            default,
+            not_null,
+            constraints,
+        })
+    }
 }
 
 /// Extract a string value from a DefElem's arg.
@@ -3798,6 +3883,31 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
         size: None,
         array_dimensions: 0,
     })
+}
+
+fn extract_type_name_from_typename(
+    type_name: &pg_query::protobuf::TypeName,
+) -> Result<String, ParseError> {
+    use pg_query::protobuf::node::Node;
+
+    let mut parts = Vec::new();
+    for name_node in &type_name.names {
+        if let Some(Node::String(s)) = &name_node.node {
+            if s.sval != "pg_catalog" {
+                parts.push(s.sval.clone());
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(ParseError::ParseError("empty type name".into()));
+    }
+    let mut name = parts.join(" ");
+    if !type_name.array_bounds.is_empty() {
+        for _ in &type_name.array_bounds {
+            name.push_str("[]");
+        }
+    }
+    Ok(name)
 }
 
 fn extract_type_name(col_def: &pg_query::protobuf::ColumnDef) -> Result<String, ParseError> {
