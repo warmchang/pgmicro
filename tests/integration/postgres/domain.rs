@@ -40,10 +40,7 @@ fn test_pg_create_domain_text_with_check(db: TempDatabase) {
     // Valid
     conn.execute("INSERT INTO contacts (addr) VALUES ('user@example.com')")
         .unwrap();
-    let mut rows = conn
-        .query("SELECT addr FROM contacts")
-        .unwrap()
-        .unwrap();
+    let mut rows = conn.query("SELECT addr FROM contacts").unwrap().unwrap();
     let StepResult::Row = rows.step().unwrap() else {
         panic!("expected row");
     };
@@ -69,7 +66,8 @@ fn test_pg_create_domain_not_null(db: TempDatabase) {
     conn.execute("CREATE TABLE t (val nn_text)").unwrap();
 
     // Valid
-    conn.execute("INSERT INTO t (val) VALUES ('hello')").unwrap();
+    conn.execute("INSERT INTO t (val) VALUES ('hello')")
+        .unwrap();
 
     // NULL should fail
     let result = conn.execute("INSERT INTO t (val) VALUES (NULL)");
