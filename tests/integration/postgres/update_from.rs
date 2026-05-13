@@ -9,11 +9,16 @@ fn setup_tables(conn: &Arc<turso_core::Connection>) {
         .unwrap();
     conn.execute("CREATE TABLE t2 (id integer PRIMARY KEY, x integer, y text)")
         .unwrap();
-    conn.execute("INSERT INTO t1 VALUES (1, 10, 'one')").unwrap();
-    conn.execute("INSERT INTO t1 VALUES (2, 20, 'two')").unwrap();
-    conn.execute("INSERT INTO t1 VALUES (3, 30, 'three')").unwrap();
-    conn.execute("INSERT INTO t2 VALUES (1, 100, 'alpha')").unwrap();
-    conn.execute("INSERT INTO t2 VALUES (2, 200, 'beta')").unwrap();
+    conn.execute("INSERT INTO t1 VALUES (1, 10, 'one')")
+        .unwrap();
+    conn.execute("INSERT INTO t1 VALUES (2, 20, 'two')")
+        .unwrap();
+    conn.execute("INSERT INTO t1 VALUES (3, 30, 'three')")
+        .unwrap();
+    conn.execute("INSERT INTO t2 VALUES (1, 100, 'alpha')")
+        .unwrap();
+    conn.execute("INSERT INTO t2 VALUES (2, 200, 'beta')")
+        .unwrap();
 }
 
 fn query_integer(conn: &Arc<turso_core::Connection>, sql: &str) -> Vec<i64> {

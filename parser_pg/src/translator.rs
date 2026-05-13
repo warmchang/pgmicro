@@ -3542,9 +3542,10 @@ impl PostgreSQLTranslator {
         }
 
         // Extract base type from type_name and map PG type names to Turso names
-        let type_name_node = domain.type_name.as_ref().ok_or_else(|| {
-            ParseError::ParseError("CREATE DOMAIN missing base type".into())
-        })?;
+        let type_name_node = domain
+            .type_name
+            .as_ref()
+            .ok_or_else(|| ParseError::ParseError("CREATE DOMAIN missing base type".into()))?;
         let pg_type = extract_type_name_from_typename(type_name_node)?;
         let base_type = match map_pg_type(&pg_type, &[]) {
             Some(mapping) => mapping.type_name,
@@ -3560,8 +3561,7 @@ impl PostgreSQLTranslator {
             let Some(Node::Constraint(constraint)) = &constraint_node.node else {
                 continue;
             };
-            let contype =
-                ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
+            let contype = ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
             match contype {
                 ConstrType::ConstrDefault => {
                     if let Some(ref raw_expr) = constraint.raw_expr {
