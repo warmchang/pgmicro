@@ -151,9 +151,7 @@ impl PostgreSQLTranslator {
             let Some(ref inner) = elt.node else { continue };
             if let Node::ColumnDef(col_def) = inner {
                 let pg_type = extract_type_name(col_def)?;
-                if pg_type.eq_ignore_ascii_case("serial")
-                    || pg_type.eq_ignore_ascii_case("bigserial")
-                {
+                if is_serial_type(&pg_type) {
                     has_autoincrement = true;
                     break;
                 }
@@ -281,8 +279,7 @@ impl PostgreSQLTranslator {
         let pg_type = extract_type_name(col_def)?;
         let typmods = extract_integer_typmods(col_def);
 
-        let is_serial =
-            pg_type.eq_ignore_ascii_case("serial") || pg_type.eq_ignore_ascii_case("bigserial");
+        let is_serial = is_serial_type(&pg_type);
 
         let mapping = map_pg_type(&pg_type, &typmods).ok_or_else(|| {
             ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}"))
@@ -3663,6 +3660,16 @@ impl PgTypeMapping {
 
 /// PostgreSQL to Turso type mapping.
 /// Returns Turso custom type names (e.g. "boolean", "varchar(100)") when a
+/// Returns true if the given PG type name is a serial variant (auto-incrementing integer).
+/// Covers all PostgreSQL serial aliases: serial, serial2, serial4, serial8,
+/// smallserial, bigserial.
+fn is_serial_type(pg_type: &str) -> bool {
+    matches!(
+        pg_type.to_uppercase().as_str(),
+        "SERIAL" | "SERIAL2" | "SERIAL4" | "SERIAL8" | "SMALLSERIAL" | "BIGSERIAL"
+    )
+}
+
 /// built-in Turso type exists, otherwise returns the base SQLite type.
 /// For array types (e.g. `INTEGER[]`, `_int4`), returns the base scalar type
 /// with `array_dimensions > 0` so native Turso arrays are used.
@@ -3718,7 +3725,8 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         }
 
         // Base types (no Turso custom type needed)
-        "INTEGER" | "INT" | "INT4" | "SERIAL" | "BIGSERIAL" | "SMALLSERIAL" => "INTEGER".into(),
+        "INTEGER" | "INT" | "INT4" | "SERIAL" | "SERIAL4" | "BIGSERIAL" | "SERIAL8"
+        | "SMALLSERIAL" | "SERIAL2" => "INTEGER".into(),
         "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" => "REAL".into(),
         "TEXT" | "BPCHAR" | "NAME" => "TEXT".into(),
         "BLOB" => "BLOB".into(),
